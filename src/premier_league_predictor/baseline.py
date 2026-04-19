@@ -16,6 +16,9 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 SEASON_CODES = ("1819", "1920", "2021", "2122", "2223", "2324", "2425")
+DEFAULT_ELO = 1500.0
+ELO_K = 20.0
+HOME_ELO_ADVANTAGE = 65.0
 
 
 @dataclass(frozen=True)
@@ -69,9 +72,28 @@ def _points_for_side(result: str, side: str) -> int:
     return 3 if result == "A" else 1 if result == "D" else 0
 
 
+def _home_score(result: str) -> float:
+    """Convert full-time result to home-team match score for Elo updates."""
+    if result == "H":
+        return 1.0
+    if result == "D":
+        return 0.5
+    if result == "A":
+        return 0.0
+    raise ValueError(f"Unexpected result label: {result}")
+
+
+def _expected_home_score(home_elo: float, away_elo: float) -> float:
+    """Return expected home-team score using Elo formula with home advantage."""
+    adjusted_home = home_elo + HOME_ELO_ADVANTAGE
+    return 1.0 / (1.0 + 10.0 ** ((away_elo - adjusted_home) / 400.0))
+
+
 def build_step1_features(matches: pd.DataFrame, lookback: int = 5) -> pd.DataFrame:
-    """Build rolling team-form features using prior matches only."""
+    """Build rolling form and persistent team-strength features from prior matches only."""
     team_history: dict[str, list[dict[str, float]]] = {}
+    team_summary: dict[str, dict[str, float]] = {}
+    team_elo: dict[str, float] = {}
     rows: list[dict[str, float | str | pd.Timestamp]] = []
 
     for _, match in matches.iterrows():
@@ -83,6 +105,14 @@ def build_step1_features(matches: pd.DataFrame, lookback: int = 5) -> pd.DataFra
 
         home_hist = team_history.get(home, [])
         away_hist = team_history.get(away, [])
+        home_summary = team_summary.setdefault(
+            home, {"matches": 0.0, "points": 0.0, "goals_for": 0.0, "goals_against": 0.0}
+        )
+        away_summary = team_summary.setdefault(
+            away, {"matches": 0.0, "points": 0.0, "goals_for": 0.0, "goals_against": 0.0}
+        )
+        home_elo_pre = team_elo.get(home, DEFAULT_ELO)
+        away_elo_pre = team_elo.get(away, DEFAULT_ELO)
 
         if len(home_hist) >= lookback and len(away_hist) >= lookback:
             home_recent = pd.DataFrame(home_hist[-lookback:])
@@ -99,6 +129,19 @@ def build_step1_features(matches: pd.DataFrame, lookback: int = 5) -> pd.DataFra
                     "away_points_last5": float(away_recent["points"].mean()),
                     "away_goals_for_last5": float(away_recent["goals_for"].mean()),
                     "away_goals_against_last5": float(away_recent["goals_against"].mean()),
+                    "home_points_per_match_all": home_summary["points"] / home_summary["matches"],
+                    "away_points_per_match_all": away_summary["points"] / away_summary["matches"],
+                    "home_goal_diff_per_match_all": (
+                        (home_summary["goals_for"] - home_summary["goals_against"])
+                        / home_summary["matches"]
+                    ),
+                    "away_goal_diff_per_match_all": (
+                        (away_summary["goals_for"] - away_summary["goals_against"])
+                        / away_summary["matches"]
+                    ),
+                    "home_elo_pre": home_elo_pre,
+                    "away_elo_pre": away_elo_pre,
+                    "elo_diff_pre": home_elo_pre - away_elo_pre,
                     "target": _result_to_label(result),
                 }
             )
@@ -117,6 +160,21 @@ def build_step1_features(matches: pd.DataFrame, lookback: int = 5) -> pd.DataFra
                 "goals_against": home_goals,
             }
         )
+        home_points = _points_for_side(result, "home")
+        away_points = _points_for_side(result, "away")
+        home_summary["matches"] += 1.0
+        home_summary["points"] += float(home_points)
+        home_summary["goals_for"] += home_goals
+        home_summary["goals_against"] += away_goals
+        away_summary["matches"] += 1.0
+        away_summary["points"] += float(away_points)
+        away_summary["goals_for"] += away_goals
+        away_summary["goals_against"] += home_goals
+
+        expected_home = _expected_home_score(home_elo_pre, away_elo_pre)
+        actual_home = _home_score(result)
+        team_elo[home] = home_elo_pre + ELO_K * (actual_home - expected_home)
+        team_elo[away] = away_elo_pre + ELO_K * ((1.0 - actual_home) - (1.0 - expected_home))
 
     if not rows:
         raise ValueError("No training rows were generated. Lower lookback or check input data.")
@@ -125,7 +183,7 @@ def build_step1_features(matches: pd.DataFrame, lookback: int = 5) -> pd.DataFra
 
 def train_baseline_model(
     features: pd.DataFrame,
-) -> tuple[Pipeline, dict[str, float | int], str, pd.DataFrame]:
+) -> tuple[Pipeline, dict[str, float | int], pd.DataFrame]:
     """Train multinomial logistic regression and return model, metrics, and row-level predictions."""
     feature_cols = [
         "home_points_last5",
@@ -134,6 +192,13 @@ def train_baseline_model(
         "away_points_last5",
         "away_goals_for_last5",
         "away_goals_against_last5",
+        "home_points_per_match_all",
+        "away_points_per_match_all",
+        "home_goal_diff_per_match_all",
+        "away_goal_diff_per_match_all",
+        "home_elo_pre",
+        "away_elo_pre",
+        "elo_diff_pre",
     ]
     X = features[feature_cols]
     y = features["target"]
@@ -160,13 +225,15 @@ def train_baseline_model(
     y_pred = model.predict(X_test)
     y_prob = model.predict_proba(X_test)
 
-    metrics: dict[str, float | int] = {
+    metrics: dict[str, float | int | str] = {
         "train_rows": len(X_train),
         "test_rows": len(X_test),
         "accuracy": float(accuracy_score(y_test, y_pred)),
         "log_loss": float(log_loss(y_test, y_prob, labels=model.classes_)),
     }
-    report = classification_report(y_test, y_pred, digits=3, zero_division=0)
+    metrics["classification_report_text"] = classification_report(
+        y_test, y_pred, digits=3, zero_division=0
+    )
 
     # Add row-level predictions so users can inspect actual vs predicted outcomes in Data Wrangler.
     all_pred = model.predict(X)
@@ -181,7 +248,7 @@ def train_baseline_model(
     for class_idx, class_name in enumerate(model.classes_):
         features_with_predictions[f"pred_prob_{class_name}"] = all_prob[:, class_idx]
 
-    return model, metrics, report, features_with_predictions
+    return model, metrics, features_with_predictions
 
 
 def run_step1_baseline(project_root: Path, lookback: int = 5) -> BaselineArtifacts:
@@ -200,11 +267,10 @@ def run_step1_baseline(project_root: Path, lookback: int = 5) -> BaselineArtifac
 
     features = build_step1_features(matches=matches, lookback=lookback)
 
-    model, metrics, report, features_with_predictions = train_baseline_model(features)
+    model, metrics, features_with_predictions = train_baseline_model(features)
     features_with_predictions.to_csv(training_path, index=False)
     joblib.dump(model, model_path)
-    metrics_with_report = {**metrics, "classification_report_text": report}
-    metrics_path.write_text(json.dumps(metrics_with_report, indent=2), encoding="utf-8")
+    metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
     print("Step 1 baseline complete.")
     print(f"Raw data saved: {raw_path}")

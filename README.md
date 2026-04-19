@@ -9,7 +9,7 @@ outcomes as one of three classes:
 
 Step 1 keeps things intentionally simple and easy to follow:
 - download historical EPL results
-- build intuitive "recent form" features
+- build recent-form features and persistent team-strength features
 - train a baseline Logistic Regression model
 - evaluate with accuracy and log loss
 
@@ -56,9 +56,9 @@ python3 scripts/run_epl_baseline.py
 1. Downloads EPL CSV data from football-data.co.uk for seasons 2018-19 through
    2024-25.
 2. Builds pre-match features using each team's prior matches only:
-   - rolling points per match (`form_points_5`)
-   - rolling goals for (`form_gf_5`)
-   - rolling goals against (`form_ga_5`)
+   - rolling 5-match form (points/goals for/goals against)
+   - long-run team strength (points per match and goal difference per match)
+   - pre-match Elo ratings and Elo difference
 3. Trains multinomial Logistic Regression on a time-based split.
 4. Prints baseline metrics and writes artifacts:
    - `data/raw/epl_matches.csv`
