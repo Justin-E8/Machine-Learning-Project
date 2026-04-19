@@ -125,8 +125,8 @@ def build_step1_features(matches: pd.DataFrame, lookback: int = 5) -> pd.DataFra
 
 def train_baseline_model(
     features: pd.DataFrame,
-) -> tuple[Pipeline, dict[str, float | int], str]:
-    """Train multinomial logistic regression and return model + metrics."""
+) -> tuple[Pipeline, dict[str, float | int], str, pd.DataFrame]:
+    """Train multinomial logistic regression and return model, metrics, and row-level predictions."""
     feature_cols = [
         "home_points_last5",
         "home_goals_for_last5",
@@ -167,7 +167,21 @@ def train_baseline_model(
         "log_loss": float(log_loss(y_test, y_prob, labels=model.classes_)),
     }
     report = classification_report(y_test, y_pred, digits=3, zero_division=0)
-    return model, metrics, report
+
+    # Add row-level predictions so users can inspect actual vs predicted outcomes in Data Wrangler.
+    all_pred = model.predict(X)
+    all_prob = model.predict_proba(X)
+    features_with_predictions = features.copy()
+    features_with_predictions["split"] = "train"
+    features_with_predictions.loc[split_idx:, "split"] = "test"
+    features_with_predictions["predicted_target"] = all_pred
+    features_with_predictions["prediction_correct"] = (
+        features_with_predictions["target"] == features_with_predictions["predicted_target"]
+    )
+    for class_idx, class_name in enumerate(model.classes_):
+        features_with_predictions[f"pred_prob_{class_name}"] = all_prob[:, class_idx]
+
+    return model, metrics, report, features_with_predictions
 
 
 def run_step1_baseline(project_root: Path, lookback: int = 5) -> BaselineArtifacts:
@@ -185,9 +199,9 @@ def run_step1_baseline(project_root: Path, lookback: int = 5) -> BaselineArtifac
     matches.to_csv(raw_path, index=False)
 
     features = build_step1_features(matches=matches, lookback=lookback)
-    features.to_csv(training_path, index=False)
 
-    model, metrics, report = train_baseline_model(features)
+    model, metrics, report, features_with_predictions = train_baseline_model(features)
+    features_with_predictions.to_csv(training_path, index=False)
     joblib.dump(model, model_path)
     metrics_with_report = {**metrics, "classification_report_text": report}
     metrics_path.write_text(json.dumps(metrics_with_report, indent=2), encoding="utf-8")
