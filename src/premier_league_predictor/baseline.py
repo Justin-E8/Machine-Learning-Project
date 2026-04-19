@@ -52,6 +52,7 @@ class BaselineArtifacts:
 class ModelComparisonResult:
     logreg_metrics: dict[str, float | int | str]
     goal_based_metrics: dict[str, float | int | str]
+    draw_aware_metrics: dict[str, float | int | str]
     summary_rows: list[dict[str, float | int | str]]
 
 
@@ -418,6 +419,176 @@ def train_goal_based_model(
     return metrics, features_with_predictions
 
 
+def _build_draw_feature_frame(features: pd.DataFrame) -> pd.DataFrame:
+    """Build a draw-focused feature matrix from baseline pre-match features."""
+    frame = features[FEATURE_COLUMNS].copy()
+    frame["abs_elo_diff"] = frame["elo_diff_pre"].abs()
+    frame["abs_points_diff_last5"] = (frame["home_points_last5"] - frame["away_points_last5"]).abs()
+    frame["abs_goal_diff_strength"] = (
+        frame["home_goal_diff_per_match_strength"] - frame["away_goal_diff_per_match_strength"]
+    ).abs()
+    frame["expected_goal_total_proxy"] = (
+        frame["home_goals_for_last5"] + frame["away_goals_for_last5"]
+    ) / 2.0
+    frame["expected_goal_diff_proxy"] = (
+        frame["home_goals_for_last5"] - frame["away_goals_for_last5"]
+    ).abs()
+    return frame
+
+
+def _compose_outcome_probs(
+    p_draw: np.ndarray,
+    p_home_non_draw: np.ndarray,
+) -> np.ndarray:
+    """Compose away/draw/home probabilities from staged model probabilities."""
+    p_home = (1.0 - p_draw) * p_home_non_draw
+    p_away = (1.0 - p_draw) * (1.0 - p_home_non_draw)
+    probs = np.column_stack([p_away, p_draw, p_home])
+    probs = np.clip(probs, 1e-8, None)
+    probs /= probs.sum(axis=1, keepdims=True)
+    return probs
+
+
+def _predict_with_draw_threshold(
+    p_draw: np.ndarray,
+    p_home_non_draw: np.ndarray,
+    draw_threshold: float,
+) -> np.ndarray:
+    """Apply draw decision threshold, then classify remaining matches home/away."""
+    pred = np.where(p_home_non_draw >= 0.5, "home_win", "away_win")
+    pred = pred.astype(object)
+    pred[p_draw >= draw_threshold] = "draw"
+    return pred.astype(str)
+
+
+def train_draw_aware_model(
+    features: pd.DataFrame,
+) -> tuple[dict[str, float | int | str], pd.DataFrame]:
+    """
+    Train a draw-aware two-stage model and return metrics + row-level predictions.
+
+    Stage 1: predict draw vs non-draw.
+    Stage 2: for non-draw matches, predict home-win vs away-win.
+    A draw threshold is tuned on a validation window of the training period.
+    """
+    X = _build_draw_feature_frame(features)
+    y = features["target"]
+    split_idx = int(len(features) * 0.8)
+    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+    if X_test.empty:
+        raise ValueError("Test set is empty. Need more rows or lower training split.")
+
+    # Reserve a validation tail inside training for threshold tuning.
+    train_fit_end = int(len(X_train) * 0.85)
+    train_fit_end = max(train_fit_end, 50)
+    if train_fit_end >= len(X_train):
+        train_fit_end = len(X_train) - 1
+    X_fit, X_val = X_train.iloc[:train_fit_end], X_train.iloc[train_fit_end:]
+    y_fit, y_val = y_train.iloc[:train_fit_end], y_train.iloc[train_fit_end:]
+
+    draw_model = Pipeline(
+        steps=[
+            ("scaler", StandardScaler()),
+            (
+                "classifier",
+                LogisticRegression(
+                    max_iter=6000,
+                    random_state=42,
+                    class_weight={0: 1.0, 1: 1.4},
+                    C=1.0,
+                ),
+            ),
+        ]
+    )
+    y_draw_fit = (y_fit == "draw").astype(int)
+    draw_model.fit(X_fit, y_draw_fit)
+
+    non_draw_fit = y_fit != "draw"
+    home_away_model = Pipeline(
+        steps=[
+            ("scaler", StandardScaler()),
+            ("classifier", LogisticRegression(max_iter=6000, random_state=42, C=1.0)),
+        ]
+    )
+    y_home_fit = (y_fit[non_draw_fit] == "home_win").astype(int)
+    home_away_model.fit(X_fit[non_draw_fit], y_home_fit)
+
+    # Tune draw threshold on validation to balance accuracy and draw-rate realism.
+    val_p_draw = draw_model.predict_proba(X_val)[:, 1]
+    val_p_home_non_draw = home_away_model.predict_proba(X_val)[:, 1]
+    val_actual_draw_rate = float((y_val == "draw").mean())
+    best_threshold = 0.30
+    best_score = -float("inf")
+    best_acc = 0.0
+    best_gap = float("inf")
+    for threshold in np.arange(0.20, 0.351, 0.005):
+        val_pred = _predict_with_draw_threshold(val_p_draw, val_p_home_non_draw, float(threshold))
+        val_acc = float(accuracy_score(y_val, val_pred))
+        val_draw_rate = float((val_pred == "draw").mean())
+        draw_gap = abs(val_draw_rate - val_actual_draw_rate)
+        score = val_acc - 0.08 * draw_gap
+        if score > best_score or (score == best_score and val_acc > best_acc):
+            best_score = score
+            best_acc = val_acc
+            best_gap = draw_gap
+            best_threshold = float(threshold)
+
+    # Refit staged models on full training window.
+    draw_model.fit(X_train, (y_train == "draw").astype(int))
+    non_draw_train = y_train != "draw"
+    y_home_train = (y_train[non_draw_train] == "home_win").astype(int)
+    home_away_model.fit(X_train[non_draw_train], y_home_train)
+
+    classes = ["away_win", "draw", "home_win"]
+    test_p_draw = draw_model.predict_proba(X_test)[:, 1]
+    test_p_home_non_draw = home_away_model.predict_proba(X_test)[:, 1]
+    test_probs = _compose_outcome_probs(test_p_draw, test_p_home_non_draw)
+    test_pred = _predict_with_draw_threshold(
+        test_p_draw,
+        test_p_home_non_draw,
+        draw_threshold=best_threshold,
+    )
+
+    metrics: dict[str, float | int | str] = {
+        "train_rows": len(X_train),
+        "test_rows": len(X_test),
+        "accuracy": float(accuracy_score(y_test, test_pred)),
+        "log_loss": float(log_loss(y_test, test_probs, labels=classes)),
+        "draw_threshold": best_threshold,
+        "validation_draw_rate_gap": best_gap,
+        "test_draw_pred_rate": float((test_pred == "draw").mean()),
+        "test_draw_actual_rate": float((y_test == "draw").mean()),
+    }
+    metrics["classification_report_text"] = classification_report(
+        y_test, test_pred, digits=3, zero_division=0
+    )
+
+    all_p_draw = draw_model.predict_proba(X)[:, 1]
+    all_p_home_non_draw = home_away_model.predict_proba(X)[:, 1]
+    all_probs = _compose_outcome_probs(all_p_draw, all_p_home_non_draw)
+    all_pred = _predict_with_draw_threshold(
+        all_p_draw,
+        all_p_home_non_draw,
+        draw_threshold=best_threshold,
+    )
+
+    features_with_predictions = features.copy()
+    features_with_predictions["split"] = "train"
+    features_with_predictions.loc[split_idx:, "split"] = "test"
+    features_with_predictions["predicted_target"] = all_pred
+    features_with_predictions["prediction_correct"] = (
+        features_with_predictions["target"] == features_with_predictions["predicted_target"]
+    )
+    features_with_predictions["pred_prob_away_win"] = all_probs[:, 0]
+    features_with_predictions["pred_prob_draw"] = all_probs[:, 1]
+    features_with_predictions["pred_prob_home_win"] = all_probs[:, 2]
+    features_with_predictions["pred_draw_stage_prob"] = all_p_draw
+    features_with_predictions["pred_home_non_draw_prob"] = all_p_home_non_draw
+
+    return metrics, features_with_predictions
+
+
 def compare_outcome_vs_goal_models(
     features: pd.DataFrame,
     max_goals: int = 10,
@@ -429,6 +600,7 @@ def compare_outcome_vs_goal_models(
     """
     _, logreg_metrics, logreg_rows = train_baseline_model(features)
     goal_metrics, goal_rows = train_goal_based_model(features, max_goals=max_goals)
+    draw_aware_metrics, draw_aware_rows = train_draw_aware_model(features)
 
     def _draw_metrics(metrics: dict[str, float | int | str], rows: pd.DataFrame) -> dict[str, float]:
         test_rows = rows[rows["split"] == "test"]
@@ -443,6 +615,7 @@ def compare_outcome_vs_goal_models(
 
     logreg_draw = _draw_metrics(logreg_metrics, logreg_rows)
     goal_draw = _draw_metrics(goal_metrics, goal_rows)
+    draw_aware_draw = _draw_metrics(draw_aware_metrics, draw_aware_rows)
 
     summary_rows = [
         {
@@ -453,10 +626,15 @@ def compare_outcome_vs_goal_models(
             "model": "goal_poisson",
             **goal_draw,
         },
+        {
+            "model": "draw_aware_staged",
+            **draw_aware_draw,
+        },
     ]
     return ModelComparisonResult(
         logreg_metrics=logreg_metrics,
         goal_based_metrics=goal_metrics,
+        draw_aware_metrics=draw_aware_metrics,
         summary_rows=summary_rows,
     )
 

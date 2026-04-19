@@ -65,7 +65,7 @@ Predict upcoming fixtures (using completed matches through 2025/26 + fixtures fe
 python3 scripts/predict_upcoming_fixtures.py
 ```
 
-Compare direct outcome model vs goals-first Poisson model:
+Compare direct outcome, goals-first Poisson, and draw-aware staged models:
 
 ```bash
 python3 scripts/compare_goal_model.py

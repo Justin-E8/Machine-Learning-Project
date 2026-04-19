@@ -1,4 +1,4 @@
-"""Compare direct outcome model with goals-first Poisson model."""
+"""Compare direct, goals-first, and draw-aware outcome models."""
 
 from __future__ import annotations
 
@@ -58,6 +58,7 @@ def main(
         "summary_rows": comparison.summary_rows,
         "direct_logistic_metrics": comparison.logreg_metrics,
         "goal_poisson_metrics": comparison.goal_based_metrics,
+        "draw_aware_metrics": comparison.draw_aware_metrics,
     }
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
