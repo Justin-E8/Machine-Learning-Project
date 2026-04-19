@@ -15,7 +15,7 @@ app = typer.Typer(add_completion=False)
 def main(
     lookback: int = typer.Option(5, min=2, help="Number of prior matches per team."),
     strength_window: int = typer.Option(
-        38,
+        20,
         min=5,
         help="Window size for persistent team strength features.",
     ),
