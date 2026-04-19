@@ -23,7 +23,9 @@ Step 1 keeps things intentionally simple and easy to follow:
 ├── models/
 │   └── .gitkeep
 ├── scripts/
-│   └── run_epl_baseline.py
+│   ├── run_epl_baseline.py
+│   ├── predict_upcoming_fixtures.py
+│   └── compare_goal_model.py
 ├── src/
 │   └── premier_league_predictor/
 │       ├── __init__.py
@@ -61,6 +63,12 @@ Predict upcoming fixtures (using completed matches through 2025/26 + fixtures fe
 
 ```bash
 python3 scripts/predict_upcoming_fixtures.py
+```
+
+Compare direct outcome model vs goals-first Poisson model:
+
+```bash
+python3 scripts/compare_goal_model.py
 ```
 
 Optional (date filter):

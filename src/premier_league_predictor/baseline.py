@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
 
 import joblib
+import numpy as np
 import pandas as pd
 import requests
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LogisticRegression, PoissonRegressor
 from sklearn.metrics import accuracy_score, classification_report, log_loss
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -44,6 +46,13 @@ class BaselineArtifacts:
     training_data_path: Path
     model_path: Path
     metrics_path: Path
+
+
+@dataclass(frozen=True)
+class ModelComparisonResult:
+    logreg_metrics: dict[str, float | int | str]
+    goal_based_metrics: dict[str, float | int | str]
+    summary_rows: list[dict[str, float | int | str]]
 
 
 def _season_url(season_code: str) -> str:
@@ -159,6 +168,8 @@ def build_step1_features(
                     "season_code": season_code,
                     "home_team": home,
                     "away_team": away,
+                    "home_goals_actual": home_goals,
+                    "away_goals_actual": away_goals,
                     "home_points_last5": float(home_recent["points"].mean()),
                     "home_goals_for_last5": float(home_recent["goals_for"].mean()),
                     "home_goals_against_last5": float(home_recent["goals_against"].mean()),
@@ -273,6 +284,181 @@ def train_baseline_model(
         features_with_predictions[f"pred_prob_{class_name}"] = all_prob[:, class_idx]
 
     return model, metrics, features_with_predictions
+
+
+def _poisson_prob_vector(mean_goals: float, max_goals: int) -> np.ndarray:
+    """
+    Return Poisson probabilities for goals 0..max_goals.
+
+    The vector is normalized to handle small truncation mass.
+    """
+    safe_mean = max(float(mean_goals), 1e-8)
+    probs = np.zeros(max_goals + 1, dtype=float)
+    probs[0] = math.exp(-safe_mean)
+    for goals in range(1, max_goals + 1):
+        probs[goals] = probs[goals - 1] * safe_mean / goals
+
+    total = probs.sum()
+    if total <= 0:
+        probs[:] = 1.0 / len(probs)
+    else:
+        probs /= total
+    return probs
+
+
+def _outcome_probs_from_goal_means(
+    home_mean: float,
+    away_mean: float,
+    max_goals: int,
+) -> tuple[float, float, float]:
+    """
+    Convert expected home/away goals into outcome probabilities.
+
+    Returns:
+      (p_away_win, p_draw, p_home_win)
+    """
+    home_probs = _poisson_prob_vector(home_mean, max_goals=max_goals)
+    away_probs = _poisson_prob_vector(away_mean, max_goals=max_goals)
+    score_matrix = np.outer(home_probs, away_probs)
+    score_matrix /= score_matrix.sum()
+
+    p_home_win = float(np.tril(score_matrix, k=-1).sum())
+    p_draw = float(np.trace(score_matrix))
+    p_away_win = float(np.triu(score_matrix, k=1).sum())
+    return p_away_win, p_draw, p_home_win
+
+
+def train_goal_based_model(
+    features: pd.DataFrame,
+    max_goals: int = 10,
+) -> tuple[dict[str, float | int | str], pd.DataFrame]:
+    """
+    Train a goals-first model (Poisson home/away goals), then derive outcomes.
+
+    The model predicts expected goals for each side and converts those expected
+    goals into win/draw/loss probabilities using a Poisson score matrix.
+    """
+    if max_goals < 4:
+        raise ValueError("max_goals must be at least 4 for stable outcome conversion")
+
+    X = features[FEATURE_COLUMNS]
+    y = features["target"]
+    y_home_goals = features["home_goals_actual"]
+    y_away_goals = features["away_goals_actual"]
+
+    split_idx = int(len(features) * 0.8)
+    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+    yh_train, yh_test = y_home_goals.iloc[:split_idx], y_home_goals.iloc[split_idx:]
+    ya_train, ya_test = y_away_goals.iloc[:split_idx], y_away_goals.iloc[split_idx:]
+    if X_test.empty:
+        raise ValueError("Test set is empty. Need more rows or lower training split.")
+
+    home_goal_model = Pipeline(
+        steps=[
+            ("scaler", StandardScaler()),
+            ("poisson", PoissonRegressor(alpha=0.05, max_iter=500)),
+        ]
+    )
+    away_goal_model = Pipeline(
+        steps=[
+            ("scaler", StandardScaler()),
+            ("poisson", PoissonRegressor(alpha=0.05, max_iter=500)),
+        ]
+    )
+    home_goal_model.fit(X_train, yh_train)
+    away_goal_model.fit(X_train, ya_train)
+
+    classes = ["away_win", "draw", "home_win"]
+
+    test_home_means = home_goal_model.predict(X_test)
+    test_away_means = away_goal_model.predict(X_test)
+    test_probs = np.array(
+        [
+            _outcome_probs_from_goal_means(hm, am, max_goals=max_goals)
+            for hm, am in zip(test_home_means, test_away_means)
+        ]
+    )
+    test_pred = np.array(classes)[test_probs.argmax(axis=1)]
+
+    metrics: dict[str, float | int | str] = {
+        "train_rows": len(X_train),
+        "test_rows": len(X_test),
+        "accuracy": float(accuracy_score(y_test, test_pred)),
+        "log_loss": float(log_loss(y_test, test_probs, labels=classes)),
+        "goal_model_max_goals": max_goals,
+    }
+    metrics["classification_report_text"] = classification_report(
+        y_test, test_pred, digits=3, zero_division=0
+    )
+
+    all_home_means = home_goal_model.predict(X)
+    all_away_means = away_goal_model.predict(X)
+    all_probs = np.array(
+        [
+            _outcome_probs_from_goal_means(hm, am, max_goals=max_goals)
+            for hm, am in zip(all_home_means, all_away_means)
+        ]
+    )
+    all_pred = np.array(classes)[all_probs.argmax(axis=1)]
+
+    features_with_predictions = features.copy()
+    features_with_predictions["split"] = "train"
+    features_with_predictions.loc[split_idx:, "split"] = "test"
+    features_with_predictions["predicted_target"] = all_pred
+    features_with_predictions["prediction_correct"] = (
+        features_with_predictions["target"] == features_with_predictions["predicted_target"]
+    )
+    features_with_predictions["pred_home_goals_mean"] = np.maximum(all_home_means, 0.0)
+    features_with_predictions["pred_away_goals_mean"] = np.maximum(all_away_means, 0.0)
+    features_with_predictions["pred_prob_away_win"] = all_probs[:, 0]
+    features_with_predictions["pred_prob_draw"] = all_probs[:, 1]
+    features_with_predictions["pred_prob_home_win"] = all_probs[:, 2]
+
+    return metrics, features_with_predictions
+
+
+def compare_outcome_vs_goal_models(
+    features: pd.DataFrame,
+    max_goals: int = 10,
+) -> ModelComparisonResult:
+    """
+    Compare direct outcome classification versus goals-first Poisson modeling.
+
+    Returns both metrics dicts and a compact summary table payload.
+    """
+    _, logreg_metrics, logreg_rows = train_baseline_model(features)
+    goal_metrics, goal_rows = train_goal_based_model(features, max_goals=max_goals)
+
+    def _draw_metrics(metrics: dict[str, float | int | str], rows: pd.DataFrame) -> dict[str, float]:
+        test_rows = rows[rows["split"] == "test"]
+        draw_pred_rate = float((test_rows["predicted_target"] == "draw").mean())
+        draw_actual_rate = float((test_rows["target"] == "draw").mean())
+        return {
+            "accuracy": float(metrics["accuracy"]),
+            "log_loss": float(metrics["log_loss"]),
+            "draw_pred_rate": draw_pred_rate,
+            "draw_actual_rate": draw_actual_rate,
+        }
+
+    logreg_draw = _draw_metrics(logreg_metrics, logreg_rows)
+    goal_draw = _draw_metrics(goal_metrics, goal_rows)
+
+    summary_rows = [
+        {
+            "model": "direct_logistic",
+            **logreg_draw,
+        },
+        {
+            "model": "goal_poisson",
+            **goal_draw,
+        },
+    ]
+    return ModelComparisonResult(
+        logreg_metrics=logreg_metrics,
+        goal_based_metrics=goal_metrics,
+        summary_rows=summary_rows,
+    )
 
 
 def run_step1_baseline(
