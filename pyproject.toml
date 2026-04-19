@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "inflation-nowcasting"
+name = "premier-league-predictor"
 version = "0.1.0"
-description = "Inflation nowcasting starter project with ML and FastAPI"
+description = "Premier League match outcome predictor starter project"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -14,10 +14,7 @@ dependencies = [
   "pandas>=2.2.2",
   "scikit-learn>=1.6.1",
   "typer>=0.16.0",
-  "uvicorn>=0.34.2",
-  "fastapi>=0.115.12",
   "requests>=2.32.3",
-  "httpx>=0.28.1",
 ]
 
 [project.optional-dependencies]

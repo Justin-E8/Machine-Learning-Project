@@ -1,39 +1,33 @@
-# Inflation Nowcasting App
+# Premier League Match Predictor (Step 1 Baseline)
 
-An end-to-end machine learning starter project for forecasting next-month U.S.
-inflation (CPI month-over-month change) using public macroeconomic time series.
+This repository now focuses on a soccer project: predicting Premier League match
+outcomes as one of three classes:
 
-This project is intentionally structured so you can build it step-by-step in
-VSCode:
-- Start as a Python ML project (data pipeline + model training).
-- Upgrade to an API service.
-- Optionally add a frontend and deploy.
+- `H`: Home win
+- `D`: Draw
+- `A`: Away win
+
+Step 1 keeps things intentionally simple and easy to follow:
+- download historical EPL results
+- build intuitive "recent form" features
+- train a baseline Logistic Regression model
+- evaluate with accuracy and log loss
 
 ## 1) Project Structure
 
 ```text
 .
-├── app/
-│   └── main.py                        # FastAPI service
 ├── data/
 │   ├── processed/.gitkeep
 │   └── raw/.gitkeep
 ├── models/
 │   └── .gitkeep
-├── notebooks/                         # Optional EDA notebooks
 ├── scripts/
-│   ├── run_training.py                # Download data + train/select model
-│   ├── run_forecast.py                # Generate latest one-step forecast
-│   └── run_pipeline.py                # Convenience wrapper (train + forecast)
+│   └── run_epl_baseline.py
 ├── src/
-│   └── inflation_nowcasting/
+│   └── premier_league_predictor/
 │       ├── __init__.py
-│       ├── config.py
-│       ├── data_loader.py
-│       ├── features.py
-│       ├── modeling.py
-│       └── pipeline.py
-├── .env.example
+│       └── baseline.py
 ├── .gitignore
 ├── pyproject.toml
 └── requirements.txt
@@ -41,7 +35,7 @@ VSCode:
 
 ## 2) Quickstart (VSCode-friendly)
 
-Open this repo in VSCode and run:
+Run this inside your VSCode terminal:
 
 ```bash
 python3 -m venv .venv
@@ -51,51 +45,29 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-Run the baseline pipeline:
+Then run Step 1 baseline:
 
 ```bash
-python scripts/run_pipeline.py --refresh-data
+python3 scripts/run_epl_baseline.py
 ```
 
-You should get these generated artifacts:
-- `data/raw/macro_data.csv`
-- `data/processed/training_frame.csv`
-- `models/best_model.joblib`
-- `models/metrics.json`
-- `models/latest_forecast.json`
+## 3) What Step 1 does
 
-Start the API:
+1. Downloads EPL CSV data from football-data.co.uk for seasons 2018-19 through
+   2024-25.
+2. Builds pre-match features using each team's prior matches only:
+   - rolling points per match (`form_points_5`)
+   - rolling goals for (`form_gf_5`)
+   - rolling goals against (`form_ga_5`)
+3. Trains multinomial Logistic Regression on a time-based split.
+4. Prints baseline metrics and writes artifacts:
+   - `data/raw/epl_matches.csv`
+   - `data/processed/epl_baseline_features.csv`
+   - `models/epl_logreg_baseline.joblib`
+   - `models/epl_baseline_metrics.json`
 
-```bash
-uvicorn app.main:app --reload
-```
+## 4) Next steps after Step 1
 
-Then open:
-- `http://127.0.0.1:8000/docs`
-- `http://127.0.0.1:8000/health`
-- `http://127.0.0.1:8000/forecast`
-
-## 3) What the baseline pipeline does
-
-1. Downloads macro series from FRED:
-   - `CPIAUCSL` (target base series)
-   - `UNRATE`, `PAYEMS`, `FEDFUNDS`, `DGS10`, `DGS2`, `PPIACO`
-2. Builds lag-based and percent-change features.
-3. Trains two baseline models:
-   - Ridge Regression
-   - HistGradientBoostingRegressor
-4. Picks the best model by RMSE on a time-based holdout window.
-5. Saves model, metrics, and latest forecast artifact.
-
-## 4) Suggested next milestones
-
-- **Milestone A (current):** baseline pipeline + API.
-- **Milestone B:** richer feature engineering (term spread, rolling stats, YoY).
-- **Milestone C:** experiment tracking (MLflow or lightweight CSV logging).
-- **Milestone D:** frontend dashboard (React or Streamlit) + deployment.
-
-## 5) Notes
-
-- Data downloads require internet access to FRED endpoints.
-- Baseline data ingestion uses FRED public CSV endpoints (no API key required).
-- This starter prioritizes clean engineering and reproducible workflows.
+- Step 2: add stronger features (home/away splits, Elo-style rating, rest days).
+- Step 3: compare models (RandomForest/XGBoost) and calibration.
+- Step 4: ship a website (Streamlit or FastAPI + frontend).
