@@ -15,12 +15,27 @@ from sklearn.metrics import accuracy_score, classification_report, log_loss
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-SEASON_CODES = ("1819", "1920", "2021", "2122", "2223", "2324", "2425")
+SEASON_CODES = ("1819", "1920", "2021", "2122", "2223", "2324", "2425", "2526")
 DEFAULT_ELO = 1500.0
 ELO_K = 20.0
 HOME_ELO_ADVANTAGE = 65.0
 DEFAULT_STRENGTH_WINDOW = 20
 DEFAULT_ELO_SEASON_DECAY = 0.75
+FEATURE_COLUMNS = [
+    "home_points_last5",
+    "home_goals_for_last5",
+    "home_goals_against_last5",
+    "away_points_last5",
+    "away_goals_for_last5",
+    "away_goals_against_last5",
+    "home_points_per_match_strength",
+    "away_points_per_match_strength",
+    "home_goal_diff_per_match_strength",
+    "away_goal_diff_per_match_strength",
+    "home_elo_pre",
+    "away_elo_pre",
+    "elo_diff_pre",
+]
 
 
 @dataclass(frozen=True)

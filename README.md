@@ -57,10 +57,16 @@ Useful options:
 python3 scripts/run_epl_baseline.py --lookback 5 --strength-window 20 --elo-season-decay 0.75
 ```
 
+Predict upcoming fixtures (using completed matches through 2025/26 + fixtures feed):
+
+```bash
+python3 scripts/predict_upcoming_fixtures.py
+```
+
 ## 3) What Step 1 does
 
 1. Downloads EPL CSV data from football-data.co.uk for seasons 2018-19 through
-   2024-25.
+   2025-26 (completed matches so far).
 2. Builds pre-match features using each team's prior matches only:
    - rolling 5-match form (points/goals for/goals against)
    - capped-strength window stats (default last 20 matches)
@@ -72,7 +78,19 @@ python3 scripts/run_epl_baseline.py --lookback 5 --strength-window 20 --elo-seas
    - `models/epl_logreg_baseline.joblib`
    - `models/epl_baseline_metrics.json`
 
-## 4) Next steps after Step 1
+## 4) Upcoming fixtures prediction
+
+`scripts/predict_upcoming_fixtures.py` will:
+
+1. Download historical/completed EPL results (including 2025/26 so far).
+2. Train the same baseline model on completed matches.
+3. Download upcoming EPL fixtures from `https://www.football-data.co.uk/fixtures.csv`.
+4. Build pre-match features for each fixture from team state as-of now.
+5. Save predictions to:
+   - `data/processed/epl_upcoming_predictions.csv`
+   - `models/epl_upcoming_predictions.json`
+
+## 5) Next steps after Step 1
 
 - Step 2: add stronger features (home/away splits, Elo-style rating, rest days).
 - Step 3: compare models (RandomForest/XGBoost) and calibration.

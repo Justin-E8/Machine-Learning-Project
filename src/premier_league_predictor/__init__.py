@@ -1,3 +1,3 @@
 """Premier League match outcome baseline package."""
 
-__all__ = ["baseline"]
+__all__ = ["baseline", "upcoming"]
