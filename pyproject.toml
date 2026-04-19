@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inflation-nowcasting"
+version = "0.1.0"
+description = "Inflation nowcasting starter project with ML and FastAPI"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "joblib>=1.4.2",
+  "numpy>=2.1.0",
+  "pandas>=2.2.2",
+  "scikit-learn>=1.6.1",
+  "typer>=0.16.0",
+  "uvicorn>=0.34.2",
+  "fastapi>=0.115.12",
+  "requests>=2.32.3",
+  "httpx>=0.28.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.5",
+  "ruff>=0.11.8",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

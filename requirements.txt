@@ -1,0 +1,9 @@
+joblib
+numpy
+pandas
+scikit-learn
+typer
+uvicorn
+fastapi
+requests
+httpx
