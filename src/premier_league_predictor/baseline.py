@@ -19,6 +19,8 @@ SEASON_CODES = ("1819", "1920", "2021", "2122", "2223", "2324", "2425")
 DEFAULT_ELO = 1500.0
 ELO_K = 20.0
 HOME_ELO_ADVANTAGE = 65.0
+DEFAULT_STRENGTH_WINDOW = 38
+DEFAULT_ELO_SEASON_DECAY = 0.75
 
 
 @dataclass(frozen=True)
@@ -89,14 +91,37 @@ def _expected_home_score(home_elo: float, away_elo: float) -> float:
     return 1.0 / (1.0 + 10.0 ** ((away_elo - adjusted_home) / 400.0))
 
 
-def build_step1_features(matches: pd.DataFrame, lookback: int = 5) -> pd.DataFrame:
-    """Build rolling form and persistent team-strength features from prior matches only."""
+def _apply_elo_season_decay(team_elo: dict[str, float], decay: float) -> None:
+    """Regress Elo ratings toward the default at each new season."""
+    for team, elo in team_elo.items():
+        team_elo[team] = DEFAULT_ELO + decay * (elo - DEFAULT_ELO)
+
+
+def build_step1_features(
+    matches: pd.DataFrame,
+    lookback: int = 5,
+    strength_window: int = DEFAULT_STRENGTH_WINDOW,
+    elo_season_decay: float = DEFAULT_ELO_SEASON_DECAY,
+) -> pd.DataFrame:
+    """Build rolling form and capped persistent-strength features from prior matches only."""
+    if strength_window < lookback:
+        raise ValueError("strength_window must be >= lookback")
+    if not 0.0 <= elo_season_decay <= 1.0:
+        raise ValueError("elo_season_decay must be between 0.0 and 1.0")
+
     team_history: dict[str, list[dict[str, float]]] = {}
-    team_summary: dict[str, dict[str, float]] = {}
     team_elo: dict[str, float] = {}
     rows: list[dict[str, float | str | pd.Timestamp]] = []
+    current_season: str | None = None
 
     for _, match in matches.iterrows():
+        season_code = str(match["season_code"])
+        if current_season is None:
+            current_season = season_code
+        elif season_code != current_season:
+            _apply_elo_season_decay(team_elo, decay=elo_season_decay)
+            current_season = season_code
+
         home = str(match["HomeTeam"])
         away = str(match["AwayTeam"])
         result = str(match["FTR"])
@@ -105,22 +130,18 @@ def build_step1_features(matches: pd.DataFrame, lookback: int = 5) -> pd.DataFra
 
         home_hist = team_history.get(home, [])
         away_hist = team_history.get(away, [])
-        home_summary = team_summary.setdefault(
-            home, {"matches": 0.0, "points": 0.0, "goals_for": 0.0, "goals_against": 0.0}
-        )
-        away_summary = team_summary.setdefault(
-            away, {"matches": 0.0, "points": 0.0, "goals_for": 0.0, "goals_against": 0.0}
-        )
         home_elo_pre = team_elo.get(home, DEFAULT_ELO)
         away_elo_pre = team_elo.get(away, DEFAULT_ELO)
 
         if len(home_hist) >= lookback and len(away_hist) >= lookback:
             home_recent = pd.DataFrame(home_hist[-lookback:])
             away_recent = pd.DataFrame(away_hist[-lookback:])
+            home_strength = pd.DataFrame(home_hist[-strength_window:])
+            away_strength = pd.DataFrame(away_hist[-strength_window:])
             rows.append(
                 {
                     "date": match["Date"],
-                    "season_code": match["season_code"],
+                    "season_code": season_code,
                     "home_team": home,
                     "away_team": away,
                     "home_points_last5": float(home_recent["points"].mean()),
@@ -129,15 +150,13 @@ def build_step1_features(matches: pd.DataFrame, lookback: int = 5) -> pd.DataFra
                     "away_points_last5": float(away_recent["points"].mean()),
                     "away_goals_for_last5": float(away_recent["goals_for"].mean()),
                     "away_goals_against_last5": float(away_recent["goals_against"].mean()),
-                    "home_points_per_match_all": home_summary["points"] / home_summary["matches"],
-                    "away_points_per_match_all": away_summary["points"] / away_summary["matches"],
-                    "home_goal_diff_per_match_all": (
-                        (home_summary["goals_for"] - home_summary["goals_against"])
-                        / home_summary["matches"]
+                    "home_points_per_match_strength": float(home_strength["points"].mean()),
+                    "away_points_per_match_strength": float(away_strength["points"].mean()),
+                    "home_goal_diff_per_match_strength": float(
+                        (home_strength["goals_for"] - home_strength["goals_against"]).mean()
                     ),
-                    "away_goal_diff_per_match_all": (
-                        (away_summary["goals_for"] - away_summary["goals_against"])
-                        / away_summary["matches"]
+                    "away_goal_diff_per_match_strength": float(
+                        (away_strength["goals_for"] - away_strength["goals_against"]).mean()
                     ),
                     "home_elo_pre": home_elo_pre,
                     "away_elo_pre": away_elo_pre,
@@ -160,16 +179,6 @@ def build_step1_features(matches: pd.DataFrame, lookback: int = 5) -> pd.DataFra
                 "goals_against": home_goals,
             }
         )
-        home_points = _points_for_side(result, "home")
-        away_points = _points_for_side(result, "away")
-        home_summary["matches"] += 1.0
-        home_summary["points"] += float(home_points)
-        home_summary["goals_for"] += home_goals
-        home_summary["goals_against"] += away_goals
-        away_summary["matches"] += 1.0
-        away_summary["points"] += float(away_points)
-        away_summary["goals_for"] += away_goals
-        away_summary["goals_against"] += home_goals
 
         expected_home = _expected_home_score(home_elo_pre, away_elo_pre)
         actual_home = _home_score(result)
@@ -192,10 +201,10 @@ def train_baseline_model(
         "away_points_last5",
         "away_goals_for_last5",
         "away_goals_against_last5",
-        "home_points_per_match_all",
-        "away_points_per_match_all",
-        "home_goal_diff_per_match_all",
-        "away_goal_diff_per_match_all",
+        "home_points_per_match_strength",
+        "away_points_per_match_strength",
+        "home_goal_diff_per_match_strength",
+        "away_goal_diff_per_match_strength",
         "home_elo_pre",
         "away_elo_pre",
         "elo_diff_pre",
@@ -251,7 +260,12 @@ def train_baseline_model(
     return model, metrics, features_with_predictions
 
 
-def run_step1_baseline(project_root: Path, lookback: int = 5) -> BaselineArtifacts:
+def run_step1_baseline(
+    project_root: Path,
+    lookback: int = 5,
+    strength_window: int = DEFAULT_STRENGTH_WINDOW,
+    elo_season_decay: float = DEFAULT_ELO_SEASON_DECAY,
+) -> BaselineArtifacts:
     """Run Step 1 data/feature/model flow and write artifacts."""
     raw_path = project_root / "data" / "raw" / "epl_matches.csv"
     training_path = project_root / "data" / "processed" / "epl_baseline_features.csv"
@@ -265,7 +279,12 @@ def run_step1_baseline(project_root: Path, lookback: int = 5) -> BaselineArtifac
     matches = load_epl_matches()
     matches.to_csv(raw_path, index=False)
 
-    features = build_step1_features(matches=matches, lookback=lookback)
+    features = build_step1_features(
+        matches=matches,
+        lookback=lookback,
+        strength_window=strength_window,
+        elo_season_decay=elo_season_decay,
+    )
 
     model, metrics, features_with_predictions = train_baseline_model(features)
     features_with_predictions.to_csv(training_path, index=False)

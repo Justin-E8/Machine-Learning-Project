@@ -51,14 +51,20 @@ Then run Step 1 baseline:
 python3 scripts/run_epl_baseline.py
 ```
 
+Useful options:
+
+```bash
+python3 scripts/run_epl_baseline.py --lookback 5 --strength-window 38 --elo-season-decay 0.75
+```
+
 ## 3) What Step 1 does
 
 1. Downloads EPL CSV data from football-data.co.uk for seasons 2018-19 through
    2024-25.
 2. Builds pre-match features using each team's prior matches only:
    - rolling 5-match form (points/goals for/goals against)
-   - long-run team strength (points per match and goal difference per match)
-   - pre-match Elo ratings and Elo difference
+   - capped-strength window stats (default last 38 matches)
+   - pre-match Elo ratings and Elo difference with season-to-season decay
 3. Trains multinomial Logistic Regression on a time-based split.
 4. Prints baseline metrics and writes artifacts:
    - `data/raw/epl_matches.csv`
