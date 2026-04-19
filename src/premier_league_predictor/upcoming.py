@@ -34,6 +34,7 @@ class UpcomingPredictionArtifacts:
     predictions_path: Path
     predictions_json_path: Path
     skipped_path: Path
+    completed_predictions_path: Path
     training_metrics_path: Path
 
 
@@ -191,14 +192,14 @@ def run_upcoming_predictions(
     """
     Train baseline model on completed matches and predict upcoming EPL fixtures.
 
-    `from_date` defaults to today's date to keep output focused on future fixtures.
+    If `from_date` is provided, only fixtures on/after that date are included.
+    By default, all currently unplayed fixtures in the feed are included.
     """
-    from_date = from_date or date.today()
-
     raw_fixtures_path = project_root / "data" / "raw" / "epl_upcoming_fixtures.csv"
     predictions_path = project_root / "data" / "processed" / "epl_upcoming_predictions.csv"
     predictions_json_path = project_root / "models" / "epl_upcoming_predictions.json"
     skipped_path = project_root / "data" / "processed" / "epl_upcoming_skipped.csv"
+    completed_predictions_path = project_root / "data" / "processed" / "epl_completed_predictions.csv"
     training_metrics_path = project_root / "models" / "epl_upcoming_training_metrics.json"
 
     raw_fixtures_path.parent.mkdir(parents=True, exist_ok=True)
@@ -212,11 +213,13 @@ def run_upcoming_predictions(
         strength_window=strength_window,
         elo_season_decay=elo_season_decay,
     )
-    model, metrics, _ = train_baseline_model(completed_features)
+    model, metrics, completed_predictions = train_baseline_model(completed_features)
+    completed_predictions.to_csv(completed_predictions_path, index=False)
     training_metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
     fixtures = load_upcoming_fixtures(div_code="E0")
-    fixtures = fixtures[fixtures["Date"].dt.date >= from_date].copy()
+    if from_date is not None:
+        fixtures = fixtures[fixtures["Date"].dt.date >= from_date].copy()
 
     completed_fixture_keys = {
         (row.Date.date(), str(row.HomeTeam), str(row.AwayTeam))
@@ -262,6 +265,7 @@ def run_upcoming_predictions(
             predictions_path=predictions_path,
             predictions_json_path=predictions_json_path,
             skipped_path=skipped_path,
+            completed_predictions_path=completed_predictions_path,
             training_metrics_path=training_metrics_path,
         )
 
@@ -289,6 +293,7 @@ def run_upcoming_predictions(
     print(f"Predictions saved: {predictions_path}")
     print(f"Predictions JSON saved: {predictions_json_path}")
     print(f"Skipped fixtures saved: {skipped_path}")
+    print(f"Completed predictions saved: {completed_predictions_path}")
     print(f"Training metrics saved: {training_metrics_path}")
     print("\nPreview:")
     preview_cols = [
@@ -306,5 +311,6 @@ def run_upcoming_predictions(
         predictions_path=predictions_path,
         predictions_json_path=predictions_json_path,
         skipped_path=skipped_path,
+        completed_predictions_path=completed_predictions_path,
         training_metrics_path=training_metrics_path,
     )

@@ -63,6 +63,12 @@ Predict upcoming fixtures (using completed matches through 2025/26 + fixtures fe
 python3 scripts/predict_upcoming_fixtures.py
 ```
 
+Optional (date filter):
+
+```bash
+python3 scripts/predict_upcoming_fixtures.py --from-date 2026-04-19
+```
+
 ## 3) What Step 1 does
 
 1. Downloads EPL CSV data from football-data.co.uk for seasons 2018-19 through
@@ -89,6 +95,8 @@ python3 scripts/predict_upcoming_fixtures.py
 5. Save predictions to:
    - `data/processed/epl_upcoming_predictions.csv`
    - `models/epl_upcoming_predictions.json`
+6. Refresh completed-match prediction snapshot:
+   - `data/processed/epl_completed_predictions.csv`
 
 ## 5) Next steps after Step 1
 

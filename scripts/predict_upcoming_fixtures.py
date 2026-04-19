@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 import typer
@@ -25,13 +26,21 @@ def main(
         max=1.0,
         help="Season-to-season Elo carryover (0 resets fully, 1 keeps full history).",
     ),
+    from_date: str = typer.Option(
+        "",
+        help="Optional YYYY-MM-DD cutoff for upcoming fixtures; empty means include all unplayed fixtures.",
+    ),
 ) -> None:
     project_root = Path(__file__).resolve().parents[1]
+    parsed_from_date = None
+    if from_date:
+        parsed_from_date = datetime.strptime(from_date, "%Y-%m-%d").date()
     run_upcoming_predictions(
         project_root=project_root,
         lookback=lookback,
         strength_window=strength_window,
         elo_season_decay=elo_season_decay,
+        from_date=parsed_from_date,
     )
 
 
