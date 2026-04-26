@@ -12,6 +12,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import requests
+from sklearn.base import clone
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression, PoissonRegressor
 from sklearn.metrics import accuracy_score, classification_report, log_loss
@@ -60,6 +61,8 @@ FEATURE_COLUMNS = [
     "elo_diff_pre",
 ]
 
+OUTCOME_LABELS = ["away_win", "draw", "home_win"]
+
 
 @dataclass(frozen=True)
 class BaselineArtifacts:
@@ -77,6 +80,15 @@ class ModelComparisonResult:
     goal_based_metrics: dict[str, float | int | str]
     draw_aware_metrics: dict[str, float | int | str]
     summary_rows: list[dict[str, float | int | str]]
+
+
+@dataclass(frozen=True)
+class WalkForwardBacktestResult:
+    """Container for rolling walk-forward evaluation outputs."""
+
+    window_count: int
+    summary_rows: list[dict[str, float | int | str]]
+    window_rows: list[dict[str, float | int | str]]
 
 
 def _season_url(season_code: str) -> str:
@@ -345,27 +357,9 @@ def _attach_prediction_columns(
     return out
 
 
-def train_baseline_model(
-    features: pd.DataFrame,
-) -> tuple[object, dict[str, float | int | str], pd.DataFrame]:
-    """
-    Train candidate models and return best model by log loss.
-
-    Candidates:
-      - multinomial logistic regression
-      - HistGradientBoostingClassifier
-    """
-    # Keep metadata columns in `features`, but train only on explicit feature sets.
-    X = features
-    y = features["target"]
-
-    split_idx = int(len(features) * 0.8)
-    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
-    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
-    if X_test.empty:
-        raise ValueError("Test set is empty. Need more rows or lower training split.")
-
-    candidates: list[tuple[str, object, list[str]]] = [
+def _candidate_models() -> list[tuple[str, object, list[str]]]:
+    """Return the candidate model set used across split and walk-forward evaluations."""
+    return [
         (
             "logistic_core",
             Pipeline(
@@ -399,19 +393,200 @@ def train_baseline_model(
         ),
     ]
 
+
+def _align_probabilities(
+    probs: np.ndarray,
+    model_classes: list[str],
+    labels: list[str] = OUTCOME_LABELS,
+) -> np.ndarray:
+    """Align model class probabilities to a fixed label order."""
+    aligned = np.full((probs.shape[0], len(labels)), 1e-9, dtype=float)
+    class_to_idx = {name: idx for idx, name in enumerate(model_classes)}
+    for col_idx, label in enumerate(labels):
+        if label in class_to_idx:
+            aligned[:, col_idx] = probs[:, class_to_idx[label]]
+    aligned /= aligned.sum(axis=1, keepdims=True)
+    return aligned
+
+
+def _safe_multiclass_log_loss(y_true: pd.Series, probs: np.ndarray) -> float:
+    """Compute multiclass log loss with stable handling for degenerate slices."""
+    try:
+        return float(log_loss(y_true, probs, labels=OUTCOME_LABELS))
+    except ValueError:
+        fallback = np.full_like(probs, 1.0 / probs.shape[1], dtype=float)
+        return float(log_loss(y_true, fallback, labels=OUTCOME_LABELS))
+
+
+def _evaluate_model_on_window(
+    *,
+    model: object,
+    feature_cols: list[str],
+    train_frame: pd.DataFrame,
+    test_frame: pd.DataFrame,
+) -> dict[str, float]:
+    """Fit one candidate on a train window and score the forward test window."""
+    fitted_model = clone(model)
+    fitted_model.fit(train_frame[feature_cols], train_frame["target"])
+    probs = _align_probabilities(
+        fitted_model.predict_proba(test_frame[feature_cols]),
+        list(fitted_model.classes_),
+    )
+    preds = fitted_model.predict(test_frame[feature_cols])
+    return {
+        "accuracy": float(accuracy_score(test_frame["target"], preds)),
+        "log_loss": _safe_multiclass_log_loss(test_frame["target"], probs),
+        "draw_pred_rate": float((pd.Series(preds) == "draw").mean()),
+    }
+
+
+def run_walk_forward_backtest(
+    *,
+    features: pd.DataFrame,
+    train_size: int = 500,
+    test_size: int = 38,
+    step_size: int = 38,
+    selection_metric: str = "accuracy",
+) -> WalkForwardBacktestResult:
+    """
+    Evaluate candidate models in rolling chronological windows.
+
+    Each window trains on ``train_size`` rows and predicts the next ``test_size``
+    rows. Windows advance by ``step_size`` rows. This mimics repeated future
+    forecasting better than a single static split.
+    """
+    if selection_metric not in {"accuracy", "log_loss"}:
+        raise ValueError("selection_metric must be 'accuracy' or 'log_loss'")
+    if train_size < 100:
+        raise ValueError("train_size must be at least 100 rows")
+    if test_size < 5:
+        raise ValueError("test_size must be at least 5 rows")
+    if step_size < 1:
+        raise ValueError("step_size must be at least 1")
+
+    ordered = features.sort_values("date").reset_index(drop=True).copy()
+    total_rows = len(ordered)
+    if total_rows < train_size + test_size:
+        raise ValueError("Not enough rows for requested walk-forward window sizes")
+
+    per_window_model_rows: list[dict[str, float | int | str]] = []
+    start = 0
+    window_idx = 0
+    candidates = _candidate_models()
+    while True:
+        train_start = start
+        train_end = train_start + train_size
+        if train_end >= total_rows:
+            break
+        test_end = min(train_end + test_size, total_rows)
+        if test_end <= train_end:
+            break
+
+        train_frame = ordered.iloc[train_start:train_end]
+        test_frame = ordered.iloc[train_end:test_end]
+        if test_frame.empty:
+            break
+
+        current_rows: list[dict[str, float | int | str]] = []
+        for model_name, model, cols in candidates:
+            metrics = _evaluate_model_on_window(
+                model=model,
+                feature_cols=cols,
+                train_frame=train_frame,
+                test_frame=test_frame,
+            )
+            current_rows.append(
+                {
+                    "window_idx": window_idx,
+                    "model": model_name,
+                    "train_start_idx": train_start,
+                    "train_end_idx": train_end - 1,
+                    "test_start_idx": train_end,
+                    "test_end_idx": test_end - 1,
+                    "test_rows": len(test_frame),
+                    "accuracy": metrics["accuracy"],
+                    "log_loss": metrics["log_loss"],
+                    "draw_pred_rate": metrics["draw_pred_rate"],
+                }
+            )
+
+        window_df = pd.DataFrame(current_rows)
+        if selection_metric == "accuracy":
+            window_df = window_df.sort_values(["accuracy", "log_loss"], ascending=[False, True])
+        else:
+            window_df = window_df.sort_values(["log_loss", "accuracy"], ascending=[True, False])
+        selected_model = str(window_df.iloc[0]["model"])
+
+        for row in window_df.to_dict(orient="records"):
+            row["selected_model"] = selected_model
+            row["is_selected"] = bool(row["model"] == selected_model)
+            per_window_model_rows.append(row)
+
+        window_idx += 1
+        start += step_size
+        if start + train_size >= total_rows:
+            break
+
+    if not per_window_model_rows:
+        raise ValueError("Walk-forward backtest produced no windows")
+
+    window_rows = pd.DataFrame(per_window_model_rows)
+    grouped = window_rows.groupby("model", sort=False)
+    summary = grouped.agg(
+        accuracy_mean=("accuracy", "mean"),
+        accuracy_std=("accuracy", "std"),
+        log_loss_mean=("log_loss", "mean"),
+        log_loss_std=("log_loss", "std"),
+        draw_pred_rate_mean=("draw_pred_rate", "mean"),
+        selected_count=("is_selected", "sum"),
+    ).reset_index()
+    summary["window_count"] = int(window_idx)
+    for col in ("accuracy_std", "log_loss_std"):
+        summary[col] = summary[col].fillna(0.0)
+    summary = summary.sort_values(["accuracy_mean", "log_loss_mean"], ascending=[False, True])
+
+    return WalkForwardBacktestResult(
+        window_count=int(window_idx),
+        summary_rows=summary.to_dict(orient="records"),
+        window_rows=window_rows.to_dict(orient="records"),
+    )
+
+
+def train_baseline_model(
+    features: pd.DataFrame,
+) -> tuple[object, dict[str, float | int | str], pd.DataFrame]:
+    """
+    Train candidate models and return the best model by holdout log loss.
+
+    Uses an 80/20 chronological split and compares the shared model set.
+    """
+    X = features
+    y = features["target"]
+
+    split_idx = int(len(features) * 0.8)
+    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+    if X_test.empty:
+        raise ValueError("Test set is empty. Need more rows or lower training split.")
+
     leaderboard: list[dict[str, float | str]] = []
     fitted: dict[str, tuple[object, list[str]]] = {}
-    for name, model, cols in candidates:
-        model.fit(X_train[cols], y_train)
-        fitted[name] = (model, cols)
-        probs_test = model.predict_proba(X_test[cols])
-        preds_test = model.predict(X_test[cols])
+    for name, model, cols in _candidate_models():
+        fitted_model = clone(model)
+        fitted_model.fit(X_train[cols], y_train)
+        fitted[name] = (fitted_model, cols)
+
+        probs_test = _align_probabilities(
+            fitted_model.predict_proba(X_test[cols]),
+            list(fitted_model.classes_),
+        )
+        preds_test = fitted_model.predict(X_test[cols])
         leaderboard.append(
             {
                 "model": name,
                 "feature_count": float(len(cols)),
                 "accuracy": float(accuracy_score(y_test, preds_test)),
-                "log_loss": float(log_loss(y_test, probs_test, labels=model.classes_)),
+                "log_loss": float(log_loss(y_test, probs_test, labels=OUTCOME_LABELS)),
                 "draw_pred_rate_test": float((pd.Series(preds_test) == "draw").mean()),
             }
         )
@@ -422,17 +597,23 @@ def train_baseline_model(
     best_name = str(leaderboard_df.iloc[0]["model"])
     best_model, best_cols = fitted[best_name]
 
-    all_probs = best_model.predict_proba(X[best_cols])
+    all_probs = _align_probabilities(
+        best_model.predict_proba(X[best_cols]),
+        list(best_model.classes_),
+    )
     all_preds = best_model.predict(X[best_cols])
     features_with_predictions = _attach_prediction_columns(
         features=features,
         probs=all_probs,
         preds=all_preds,
-        classes=list(best_model.classes_),
+        classes=OUTCOME_LABELS,
         split_idx=split_idx,
     )
 
-    best_test_probs = best_model.predict_proba(X_test[best_cols])
+    best_test_probs = _align_probabilities(
+        best_model.predict_proba(X_test[best_cols]),
+        list(best_model.classes_),
+    )
     best_test_preds = best_model.predict(X_test[best_cols])
     metrics: dict[str, float | int | str] = {
         "selected_model": best_name,
@@ -440,7 +621,7 @@ def train_baseline_model(
         "train_rows": len(X_train),
         "test_rows": len(X_test),
         "accuracy": float(accuracy_score(y_test, best_test_preds)),
-        "log_loss": float(log_loss(y_test, best_test_probs, labels=best_model.classes_)),
+        "log_loss": float(log_loss(y_test, best_test_probs, labels=OUTCOME_LABELS)),
         "draw_pred_rate_test": float((pd.Series(best_test_preds) == "draw").mean()),
         "draw_actual_rate_test": float((y_test == "draw").mean()),
         "classification_report_text": classification_report(

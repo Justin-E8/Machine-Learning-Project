@@ -23,7 +23,8 @@ No inflation code remains in this branch.
 │   ├── run_epl_baseline.py
 │   ├── benchmark_models.py
 │   ├── compare_goal_model.py
-│   └── predict_upcoming_fixtures.py
+│   ├── predict_upcoming_fixtures.py
+│   └── run_walk_forward.py
 ├── src/premier_league_predictor/
 │   ├── baseline.py
 │   └── upcoming.py
@@ -94,6 +95,24 @@ Outputs:
 - `data/processed/epl_completed_predictions.csv`
 - `models/epl_upcoming_predictions.json`
 - `models/epl_upcoming_training_metrics.json`
+
+### 5) Walk-forward evaluation (best proxy for upcoming-match accuracy)
+
+This backtest repeatedly trains on a rolling historical window and predicts the
+next block of future matches. It is closer to real deployment than one static split.
+
+```bash
+python3 scripts/run_walk_forward.py
+```
+
+Optional example:
+
+```bash
+python3 scripts/run_walk_forward.py --train-size 760 --test-size 38
+```
+
+Outputs:
+- `models/epl_walk_forward_metrics.json`
 
 ## Current tuned defaults
 
