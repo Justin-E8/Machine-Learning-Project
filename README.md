@@ -1,38 +1,56 @@
 # Premier League Match Predictor
 
-This repository is EPL-only and focused on one task:
-predicting match outcomes (`home_win`, `draw`, `away_win`) from historical match data.
+Predict EPL match outcomes (`home_win`, `draw`, `away_win`) using a single,
+no-odds, feature-based machine-learning pipeline.
 
-The current pipeline uses:
-- rolling form features
-- home/away split form
-- rest-day and momentum signals
-- Elo-based team strength with season decay
+This repository is intentionally focused and cleaned up around one main model and one
+dashboard workflow. It is designed so someone new to the project can run it quickly,
+understand the data flow, and inspect outputs in both CSV and UI form.
 
-No inflation code remains in this branch.
+---
 
-## Project structure
+## What this project does
+
+1. Downloads historical EPL results.
+2. Builds leak-free pre-match features (form, split form, strength, rest, Elo).
+3. Trains one tuned logistic model on an 80/20 chronological split.
+4. Exports row-level predictions for historical matches.
+5. Predicts upcoming fixtures to the end of the current season.
+6. Shows everything in a Streamlit dashboard.
+
+---
+
+## Repository structure
 
 ```text
 .
+├── dashboard/
+│   └── app.py                              # Streamlit dashboard
 ├── data/
-│   ├── raw/
-│   └── processed/
+│   ├── raw/                                # downloaded raw CSVs
+│   └── processed/                          # generated feature/prediction CSVs
 ├── models/
+│   ├── epl_best_model.joblib               # trained model artifact
+│   ├── epl_baseline_metrics.json           # baseline metrics summary
+│   ├── epl_upcoming_predictions.json       # upcoming predictions in JSON
+│   └── epl_upcoming_training_metrics.json  # metrics from upcoming run
 ├── scripts/
-│   ├── run_epl_baseline.py
-│   ├── benchmark_models.py
-│   ├── compare_goal_model.py
-│   └── predict_upcoming_fixtures.py
+│   ├── run_epl_baseline.py                 # train + export baseline artifacts
+│   └── predict_upcoming_fixtures.py        # train + predict upcoming fixtures
 ├── src/premier_league_predictor/
-│   ├── baseline.py
-│   └── upcoming.py
+│   ├── __init__.py
+│   ├── baseline.py                         # feature engineering + model training
+│   └── upcoming.py                         # fixture sourcing + upcoming inference
 ├── pyproject.toml
 ├── requirements.txt
 └── README.md
 ```
 
-## Setup (VSCode terminal)
+---
+
+## Quickstart (first run)
+
+From the repository root:
 
 ```bash
 python3 -m venv .venv
@@ -42,52 +60,112 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-## Run commands
-
-### 1) Train baseline model and export training artifacts
+Then run:
 
 ```bash
 python3 scripts/run_epl_baseline.py
+python3 scripts/predict_upcoming_fixtures.py
+python3 -m streamlit run dashboard/app.py
 ```
 
-Outputs:
-- `data/raw/epl_matches.csv`
-- `data/processed/epl_baseline_features.csv`
-- `models/epl_best_model.joblib`
-- `models/epl_baseline_metrics.json`
+Open the Streamlit URL shown in terminal (usually `http://localhost:8501`).
 
-### 2) Benchmark model families (logistic core/enhanced + boosting)
+---
+
+## How to run the program (day-to-day)
+
+Each new terminal session:
 
 ```bash
-python3 scripts/benchmark_models.py
+cd /path/to/Machine-Learning-Project
+source .venv/bin/activate
 ```
 
-Output:
-- `models/epl_model_benchmark.json`
-
-### 3) Compare outcome modeling strategies
-(direct classifier vs goals-first Poisson vs draw-aware staged model)
+Refresh artifacts:
 
 ```bash
-python3 scripts/compare_goal_model.py
-```
-
-Output:
-- `models/epl_model_comparison.json`
-
-### 4) Predict upcoming fixtures
-
-```bash
+python3 scripts/run_epl_baseline.py
 python3 scripts/predict_upcoming_fixtures.py
 ```
 
-Optional date filter:
+Open dashboard:
+
+```bash
+python3 -m streamlit run dashboard/app.py
+```
+
+Optional upcoming cutoff:
 
 ```bash
 python3 scripts/predict_upcoming_fixtures.py --from-date 2026-04-26
 ```
 
-Outputs:
+---
+
+## Data sources
+
+Historical and fixture data comes from public football-data feeds, with a fallback
+full-season fixture schedule for broader remaining-match coverage:
+
+- `football-data.co.uk` season CSVs (`mmz4281/.../E0.csv`) for historical matches
+- `football-data.co.uk/fixtures.csv` for short-horizon upcoming fixtures
+- OpenFootball (`football.json`) as a full-season fixture fallback
+
+Team-name normalization is applied so these sources align with training-data team names.
+
+---
+
+## Core modeling approach
+
+The project keeps only one tuned classifier path:
+
+- Model: `LogisticRegression` in a `StandardScaler` pipeline
+- Split: chronological 80% train / 20% test
+- Features:
+  - recent overall form (`last5`, `last3`)
+  - home/away split form windows
+  - capped persistent-strength windows
+  - rest-day features
+  - Elo pre-match ratings with season decay
+
+No bookmaker odds are used.
+
+---
+
+## Generated artifacts
+
+### Baseline run
+
+Command:
+
+```bash
+python3 scripts/run_epl_baseline.py
+```
+
+Writes:
+
+- `data/raw/epl_matches.csv`
+- `data/processed/epl_baseline_features.csv`
+- `models/epl_best_model.joblib`
+- `models/epl_baseline_metrics.json`
+
+`epl_baseline_features.csv` includes:
+- `target` (actual result label)
+- `predicted_target`
+- `prediction_correct`
+- `split` (`train` or `test`)
+- `pred_prob_away_win`, `pred_prob_draw`, `pred_prob_home_win` (rounded to 2 decimals)
+
+### Upcoming run
+
+Command:
+
+```bash
+python3 scripts/predict_upcoming_fixtures.py
+```
+
+Writes:
+
 - `data/raw/epl_upcoming_fixtures.csv`
 - `data/processed/epl_upcoming_predictions.csv`
 - `data/processed/epl_upcoming_skipped.csv`
@@ -95,9 +173,54 @@ Outputs:
 - `models/epl_upcoming_predictions.json`
 - `models/epl_upcoming_training_metrics.json`
 
-## Current tuned defaults
+`epl_upcoming_predictions.csv` includes confidence and class probabilities rounded
+to 2 decimals.
 
-The code is tuned for stronger recent-season behavior:
+---
+
+## Dashboard
+
+Run:
+
+```bash
+python3 -m streamlit run dashboard/app.py
+```
+
+The dashboard provides:
+
+- Upcoming predictions table
+- Completed predictions table
+- Team filters
+- Confidence threshold filter
+- Train/test split filter for completed rows
+- Snapshot cards for key metrics
+
+---
+
+## Important concepts
+
+- **target**: actual historical match outcome.
+- **predicted_target**: model prediction.
+- **prediction_correct**: whether prediction matched target.
+- **train rows**: oldest 80% used to fit the model.
+- **test rows**: newest 20% held out for evaluation metrics.
+
+For project evaluation quality, use test rows.
+For forecasting upcoming fixtures, the trained model is applied to future fixtures.
+
+---
+
+## Script options
+
+Inspect all CLI options:
+
+```bash
+python3 scripts/run_epl_baseline.py --help
+python3 scripts/predict_upcoming_fixtures.py --help
+```
+
+Current tuned defaults:
+
 - `lookback=5`
 - `strength_window=20`
 - `home_away_lookback=2`
@@ -105,9 +228,23 @@ The code is tuned for stronger recent-season behavior:
 - `elo_k=24`
 - `home_elo_advantage=80`
 
-You can inspect all options with:
+---
 
-```bash
-python3 scripts/run_epl_baseline.py --help
-python3 scripts/predict_upcoming_fixtures.py --help
-```
+## Troubleshooting
+
+- If imports fail, re-run:
+  ```bash
+  pip install -r requirements.txt
+  pip install -e .
+  ```
+- If dashboard shows stale data, re-run both scripts, then refresh browser.
+- If upcoming fixtures appear too short, run `predict_upcoming_fixtures.py` again;
+  it merges multiple sources and removes already-completed matches.
+
+---
+
+## Code maintenance status
+
+- Redundant legacy model-comparison scripts were removed.
+- The repository now uses one primary model path and one upcoming-prediction path.
+- README and in-file docstrings are aligned with current behavior.
