@@ -8,6 +8,7 @@ from datetime import date
 from io import StringIO
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import requests
 
@@ -32,6 +33,10 @@ from premier_league_predictor.baseline import (
 )
 
 FIXTURES_URL = "https://www.football-data.co.uk/fixtures.csv"
+CURRENT_SEASON_CODE = "2526"
+CURRENT_SEASON_URL = (
+    f"https://www.football-data.co.uk/mmz4281/{CURRENT_SEASON_CODE}/E0.csv"
+)
 
 
 @dataclass(frozen=True)
@@ -46,9 +51,25 @@ class UpcomingPredictionArtifacts:
     training_metrics_path: Path
 
 
+def _normalize_fixture_columns(fixtures: pd.DataFrame) -> pd.DataFrame:
+    """Normalize fixture columns to Date/Time/HomeTeam/AwayTeam."""
+    frame = fixtures.copy()
+    required = {"Date", "HomeTeam", "AwayTeam"}
+    missing = sorted(required.difference(frame.columns))
+    if missing:
+        raise ValueError(f"fixtures frame missing required columns: {missing}")
+    frame["Date"] = pd.to_datetime(frame["Date"], dayfirst=True, errors="coerce")
+    frame = frame.dropna(subset=["Date", "HomeTeam", "AwayTeam"]).copy()
+    if "Time" not in frame.columns:
+        frame["Time"] = ""
+    frame["Time"] = frame["Time"].fillna("").astype(str)
+    return frame[["Date", "Time", "HomeTeam", "AwayTeam"]].sort_values(
+        ["Date", "Time", "HomeTeam"]
+    ).reset_index(drop=True)
+
+
 def _normalize_fixtures_frame(fixtures: pd.DataFrame) -> pd.DataFrame:
     """Normalize raw fixtures feed and keep only EPL rows with valid dates."""
-
     frame = fixtures.copy()
     if "ï»¿Div" in frame.columns:
         frame = frame.rename(columns={"ï»¿Div": "Div"})
@@ -59,9 +80,28 @@ def _normalize_fixtures_frame(fixtures: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"fixtures feed missing required columns: {missing}")
 
     frame = frame[frame["Div"] == "E0"].copy()
-    frame["Date"] = pd.to_datetime(frame["Date"], dayfirst=True, errors="coerce")
-    frame = frame.dropna(subset=["Date", "HomeTeam", "AwayTeam"]).copy()
-    frame["Time"] = frame["Time"].fillna("").astype(str)
+    return _normalize_fixture_columns(frame)
+
+
+def load_current_season_unplayed_fixtures() -> pd.DataFrame:
+    """Fetch unplayed fixtures from current-season EPL CSV for full schedule coverage."""
+    response = requests.get(CURRENT_SEASON_URL, timeout=30)
+    response.raise_for_status()
+    raw = pd.read_csv(StringIO(response.text))
+    frame = _normalize_fixture_columns(raw)
+
+    has_result = (
+        raw.get("FTR", pd.Series(index=raw.index, dtype=object))
+        .astype(str)
+        .str.strip()
+        .isin({"H", "D", "A"})
+    )
+    home_goals = pd.to_numeric(raw.get("FTHG"), errors="coerce")
+    away_goals = pd.to_numeric(raw.get("FTAG"), errors="coerce")
+    has_score = home_goals.notna() & away_goals.notna()
+    unplayed_mask = ~(has_result & has_score)
+
+    frame = frame.loc[unplayed_mask].copy()
     return frame.sort_values(["Date", "Time", "HomeTeam"]).reset_index(drop=True)
 
 
@@ -242,7 +282,11 @@ def run_upcoming_predictions(
     completed_predictions.to_csv(completed_predictions_path, index=False)
     training_metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
-    fixtures = load_upcoming_fixtures()
+    fixtures_feed = load_upcoming_fixtures()
+    season_unplayed = load_current_season_unplayed_fixtures()
+    fixtures = pd.concat([fixtures_feed, season_unplayed], ignore_index=True)
+    fixtures = fixtures.drop_duplicates(subset=["Date", "HomeTeam", "AwayTeam"]).copy()
+    fixtures = fixtures.sort_values(["Date", "Time", "HomeTeam"]).reset_index(drop=True)
     if from_date is not None:
         fixtures = fixtures[fixtures["Date"].dt.date >= from_date].copy()
 
@@ -322,10 +366,10 @@ def run_upcoming_predictions(
 
         output = fixture_features[["date", "time", "home_team", "away_team"]].copy()
         output["predicted_target"] = preds
-        output["prediction_confidence"] = probs.max(axis=1)
+        output["prediction_confidence"] = np.round(probs.max(axis=1), 2)
         for label in ("away_win", "draw", "home_win"):
             if label in class_to_idx:
-                output[f"pred_prob_{label}"] = probs[:, class_to_idx[label]]
+                output[f"pred_prob_{label}"] = np.round(probs[:, class_to_idx[label]], 2)
             else:
                 output[f"pred_prob_{label}"] = 0.0
 

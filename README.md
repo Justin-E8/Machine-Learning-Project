@@ -21,8 +21,6 @@ No inflation code remains in this branch.
 ├── models/
 ├── scripts/
 │   ├── run_epl_baseline.py
-│   ├── benchmark_models.py
-│   ├── compare_goal_model.py
 │   └── predict_upcoming_fixtures.py
 ├── dashboard/
 │   └── app.py
@@ -58,26 +56,7 @@ Outputs:
 - `models/epl_best_model.joblib`
 - `models/epl_baseline_metrics.json`
 
-### 2) Benchmark model families (logistic core/enhanced + boosting)
-
-```bash
-python3 scripts/benchmark_models.py
-```
-
-Output:
-- `models/epl_model_benchmark.json`
-
-### 3) Compare outcome modeling strategies
-(direct classifier vs goals-first Poisson vs draw-aware staged model)
-
-```bash
-python3 scripts/compare_goal_model.py
-```
-
-Output:
-- `models/epl_model_comparison.json`
-
-### 4) Predict upcoming fixtures
+### 2) Predict upcoming fixtures
 
 ```bash
 python3 scripts/predict_upcoming_fixtures.py
@@ -97,7 +76,7 @@ Outputs:
 - `models/epl_upcoming_predictions.json`
 - `models/epl_upcoming_training_metrics.json`
 
-### 5) Launch dashboard for viewing predictions
+### 3) Launch dashboard for viewing predictions
 
 The dashboard reads generated CSV/JSON artifacts and lets you:
 - browse upcoming predictions with probabilities
