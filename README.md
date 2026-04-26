@@ -7,10 +7,10 @@ outcomes as one of three classes:
 - `D`: Draw
 - `A`: Away win
 
-Step 1 keeps things intentionally simple and easy to follow:
+Step 1 now focuses on improving out-of-sample accuracy (without bookmaker odds):
 - download historical EPL results
-- build intuitive "recent form" features
-- train a baseline Logistic Regression model
+- build stronger non-odds pre-match features (form, home/away splits, rest days, Elo)
+- benchmark multiple model families
 - evaluate with accuracy and log loss
 
 ## 1) Project Structure
@@ -51,23 +51,37 @@ Then run Step 1 baseline:
 python3 scripts/run_epl_baseline.py
 ```
 
+Benchmark multiple model families (logistic vs boosting) on the same feature set:
+
+```bash
+python3 scripts/benchmark_models.py
+```
+
 ## 3) What Step 1 does
 
 1. Downloads EPL CSV data from football-data.co.uk for seasons 2018-19 through
-   2024-25.
+   2025-26 (completed so far).
 2. Builds pre-match features using each team's prior matches only:
-   - rolling points per match (`form_points_5`)
-   - rolling goals for (`form_gf_5`)
-   - rolling goals against (`form_ga_5`)
-3. Trains multinomial Logistic Regression on a time-based split.
-4. Prints baseline metrics and writes artifacts:
+   - overall rolling form (points/goals for/goals against)
+   - home-only and away-only rolling form windows
+   - short-horizon momentum (last 3 matches)
+   - capped strength window trends
+   - rest-day features
+   - pre-match Elo ratings with season decay
+3. Benchmarks three model variants on a time-based split:
+   - multinomial Logistic Regression
+   - enhanced Logistic Regression (richer feature set)
+   - HistGradientBoostingClassifier
+4. Selects best model by holdout log loss, and reports leaderboard.
+5. Writes artifacts:
    - `data/raw/epl_matches.csv`
    - `data/processed/epl_baseline_features.csv`
-   - `models/epl_logreg_baseline.joblib`
+   - `models/epl_best_model.joblib`
    - `models/epl_baseline_metrics.json`
+   - `models/epl_model_benchmark.json`
 
 ## 4) Next steps after Step 1
 
-- Step 2: add stronger features (home/away splits, Elo-style rating, rest days).
-- Step 3: compare models (RandomForest/XGBoost) and calibration.
+- Step 2: add richer match-intensity features (shots, shots on target, cards) where available.
+- Step 3: add rolling time-series backtesting windows instead of one static split.
 - Step 4: ship a website (Streamlit or FastAPI + frontend).
