@@ -22,12 +22,12 @@ def main(
     lookback: int = typer.Option(5, min=3, help="Overall recent-form window."),
     strength_window: int = typer.Option(20, min=5, help="Persistent strength window."),
     home_away_lookback: int = typer.Option(
-        3,
+        2,
         min=2,
         help="Home-only / away-only recent window.",
     ),
     elo_season_decay: float = typer.Option(
-        0.75,
+        0.65,
         min=0.0,
         max=1.0,
         help="Season-to-season Elo carryover (0 resets fully, 1 keeps full history).",

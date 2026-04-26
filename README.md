@@ -57,6 +57,12 @@ Benchmark multiple model families (logistic vs boosting) on the same feature set
 python3 scripts/benchmark_models.py
 ```
 
+Useful tuned options for stronger 2025/26 performance:
+
+```bash
+python3 scripts/run_epl_baseline.py --lookback 5 --strength-window 20 --home-away-lookback 2 --elo-season-decay 0.65
+```
+
 ## 3) What Step 1 does
 
 1. Downloads EPL CSV data from football-data.co.uk for seasons 2018-19 through
@@ -67,7 +73,7 @@ python3 scripts/benchmark_models.py
    - short-horizon momentum (last 3 matches)
    - capped strength window trends
    - rest-day features
-   - pre-match Elo ratings with season decay
+   - pre-match Elo ratings with season decay (tuned defaults for recency adaptation)
 3. Benchmarks three model variants on a time-based split:
    - multinomial Logistic Regression
    - enhanced Logistic Regression (richer feature set)

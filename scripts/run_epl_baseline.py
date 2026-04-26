@@ -16,12 +16,12 @@ def main(
     lookback: int = typer.Option(5, min=3, help="Number of prior matches per team."),
     strength_window: int = typer.Option(20, min=5, help="Window size for persistent strength."),
     home_away_lookback: int = typer.Option(
-        3,
+        2,
         min=2,
         help="Recent home-only / away-only window size.",
     ),
     elo_season_decay: float = typer.Option(
-        0.75,
+        0.65,
         min=0.0,
         max=1.0,
         help="Season-to-season Elo carryover (0 reset, 1 full carry).",

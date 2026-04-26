@@ -20,11 +20,11 @@ from sklearn.preprocessing import StandardScaler
 SEASON_CODES = ("1819", "1920", "2021", "2122", "2223", "2324", "2425", "2526")
 
 DEFAULT_ELO = 1500.0
-DEFAULT_ELO_K = 20.0
-DEFAULT_HOME_ELO_ADVANTAGE = 65.0
+DEFAULT_ELO_K = 24.0
+DEFAULT_HOME_ELO_ADVANTAGE = 80.0
 DEFAULT_STRENGTH_WINDOW = 20
-DEFAULT_HOME_AWAY_LOOKBACK = 3
-DEFAULT_ELO_SEASON_DECAY = 0.75
+DEFAULT_HOME_AWAY_LOOKBACK = 2
+DEFAULT_ELO_SEASON_DECAY = 0.65
 
 CORE_FEATURE_COLUMNS = [
     "home_points_last5",
@@ -362,7 +362,7 @@ def train_baseline_model(
             Pipeline(
                 steps=[
                     ("scaler", StandardScaler()),
-                    ("classifier", LogisticRegression(max_iter=4000, random_state=42)),
+                    ("classifier", LogisticRegression(max_iter=4000, random_state=42, C=1.5)),
                 ]
             ),
             FEATURE_COLUMNS,
