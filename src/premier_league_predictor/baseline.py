@@ -82,15 +82,6 @@ class ModelComparisonResult:
     summary_rows: list[dict[str, float | int | str]]
 
 
-@dataclass(frozen=True)
-class WalkForwardBacktestResult:
-    """Container for rolling walk-forward evaluation outputs."""
-
-    window_count: int
-    summary_rows: list[dict[str, float | int | str]]
-    window_rows: list[dict[str, float | int | str]]
-
-
 def _season_url(season_code: str) -> str:
     return f"https://www.football-data.co.uk/mmz4281/{season_code}/E0.csv"
 
@@ -358,7 +349,7 @@ def _attach_prediction_columns(
 
 
 def _candidate_models() -> list[tuple[str, object, list[str]]]:
-    """Return the candidate model set used across split and walk-forward evaluations."""
+    """Return the candidate model set used across split evaluations."""
     return [
         (
             "logistic_core",
@@ -407,149 +398,6 @@ def _align_probabilities(
             aligned[:, col_idx] = probs[:, class_to_idx[label]]
     aligned /= aligned.sum(axis=1, keepdims=True)
     return aligned
-
-
-def _safe_multiclass_log_loss(y_true: pd.Series, probs: np.ndarray) -> float:
-    """Compute multiclass log loss with stable handling for degenerate slices."""
-    try:
-        return float(log_loss(y_true, probs, labels=OUTCOME_LABELS))
-    except ValueError:
-        fallback = np.full_like(probs, 1.0 / probs.shape[1], dtype=float)
-        return float(log_loss(y_true, fallback, labels=OUTCOME_LABELS))
-
-
-def _evaluate_model_on_window(
-    *,
-    model: object,
-    feature_cols: list[str],
-    train_frame: pd.DataFrame,
-    test_frame: pd.DataFrame,
-) -> dict[str, float]:
-    """Fit one candidate on a train window and score the forward test window."""
-    fitted_model = clone(model)
-    fitted_model.fit(train_frame[feature_cols], train_frame["target"])
-    probs = _align_probabilities(
-        fitted_model.predict_proba(test_frame[feature_cols]),
-        list(fitted_model.classes_),
-    )
-    preds = fitted_model.predict(test_frame[feature_cols])
-    return {
-        "accuracy": float(accuracy_score(test_frame["target"], preds)),
-        "log_loss": _safe_multiclass_log_loss(test_frame["target"], probs),
-        "draw_pred_rate": float((pd.Series(preds) == "draw").mean()),
-    }
-
-
-def run_walk_forward_backtest(
-    *,
-    features: pd.DataFrame,
-    train_size: int = 500,
-    test_size: int = 38,
-    step_size: int = 38,
-    selection_metric: str = "accuracy",
-) -> WalkForwardBacktestResult:
-    """
-    Evaluate candidate models in rolling chronological windows.
-
-    Each window trains on ``train_size`` rows and predicts the next ``test_size``
-    rows. Windows advance by ``step_size`` rows. This mimics repeated future
-    forecasting better than a single static split.
-    """
-    if selection_metric not in {"accuracy", "log_loss"}:
-        raise ValueError("selection_metric must be 'accuracy' or 'log_loss'")
-    if train_size < 100:
-        raise ValueError("train_size must be at least 100 rows")
-    if test_size < 5:
-        raise ValueError("test_size must be at least 5 rows")
-    if step_size < 1:
-        raise ValueError("step_size must be at least 1")
-
-    ordered = features.sort_values("date").reset_index(drop=True).copy()
-    total_rows = len(ordered)
-    if total_rows < train_size + test_size:
-        raise ValueError("Not enough rows for requested walk-forward window sizes")
-
-    per_window_model_rows: list[dict[str, float | int | str]] = []
-    start = 0
-    window_idx = 0
-    candidates = _candidate_models()
-    while True:
-        train_start = start
-        train_end = train_start + train_size
-        if train_end >= total_rows:
-            break
-        test_end = min(train_end + test_size, total_rows)
-        if test_end <= train_end:
-            break
-
-        train_frame = ordered.iloc[train_start:train_end]
-        test_frame = ordered.iloc[train_end:test_end]
-        if test_frame.empty:
-            break
-
-        current_rows: list[dict[str, float | int | str]] = []
-        for model_name, model, cols in candidates:
-            metrics = _evaluate_model_on_window(
-                model=model,
-                feature_cols=cols,
-                train_frame=train_frame,
-                test_frame=test_frame,
-            )
-            current_rows.append(
-                {
-                    "window_idx": window_idx,
-                    "model": model_name,
-                    "train_start_idx": train_start,
-                    "train_end_idx": train_end - 1,
-                    "test_start_idx": train_end,
-                    "test_end_idx": test_end - 1,
-                    "test_rows": len(test_frame),
-                    "accuracy": metrics["accuracy"],
-                    "log_loss": metrics["log_loss"],
-                    "draw_pred_rate": metrics["draw_pred_rate"],
-                }
-            )
-
-        window_df = pd.DataFrame(current_rows)
-        if selection_metric == "accuracy":
-            window_df = window_df.sort_values(["accuracy", "log_loss"], ascending=[False, True])
-        else:
-            window_df = window_df.sort_values(["log_loss", "accuracy"], ascending=[True, False])
-        selected_model = str(window_df.iloc[0]["model"])
-
-        for row in window_df.to_dict(orient="records"):
-            row["selected_model"] = selected_model
-            row["is_selected"] = bool(row["model"] == selected_model)
-            per_window_model_rows.append(row)
-
-        window_idx += 1
-        start += step_size
-        if start + train_size >= total_rows:
-            break
-
-    if not per_window_model_rows:
-        raise ValueError("Walk-forward backtest produced no windows")
-
-    window_rows = pd.DataFrame(per_window_model_rows)
-    grouped = window_rows.groupby("model", sort=False)
-    summary = grouped.agg(
-        accuracy_mean=("accuracy", "mean"),
-        accuracy_std=("accuracy", "std"),
-        log_loss_mean=("log_loss", "mean"),
-        log_loss_std=("log_loss", "std"),
-        draw_pred_rate_mean=("draw_pred_rate", "mean"),
-        selected_count=("is_selected", "sum"),
-    ).reset_index()
-    summary["window_count"] = int(window_idx)
-    for col in ("accuracy_std", "log_loss_std"):
-        summary[col] = summary[col].fillna(0.0)
-    summary = summary.sort_values(["accuracy_mean", "log_loss_mean"], ascending=[False, True])
-
-    return WalkForwardBacktestResult(
-        window_count=int(window_idx),
-        summary_rows=summary.to_dict(orient="records"),
-        window_rows=window_rows.to_dict(orient="records"),
-    )
 
 
 def train_baseline_model(

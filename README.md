@@ -23,8 +23,9 @@ No inflation code remains in this branch.
 │   ├── run_epl_baseline.py
 │   ├── benchmark_models.py
 │   ├── compare_goal_model.py
-│   ├── predict_upcoming_fixtures.py
-│   └── run_walk_forward.py
+│   └── predict_upcoming_fixtures.py
+├── dashboard/
+│   └── app.py
 ├── src/premier_league_predictor/
 │   ├── baseline.py
 │   └── upcoming.py
@@ -96,41 +97,18 @@ Outputs:
 - `models/epl_upcoming_predictions.json`
 - `models/epl_upcoming_training_metrics.json`
 
-### 5) Walk-forward evaluation (best proxy for upcoming-match accuracy)
+### 5) Launch dashboard for viewing predictions
 
-This backtest repeatedly trains on a rolling historical window and predicts the
-next block of future matches. It is closer to real deployment than one static split.
-
-```bash
-python3 scripts/run_walk_forward.py
-```
-
-Optional example:
+The dashboard reads generated CSV/JSON artifacts and lets you:
+- browse upcoming predictions with probabilities
+- inspect completed prediction accuracy (including split filter)
+- see model metrics JSON files
 
 ```bash
-python3 scripts/run_walk_forward.py --train-size 760 --test-size 38
+python3 -m streamlit run dashboard/app.py
 ```
 
-Outputs:
-- `models/epl_walk_forward_metrics.json`
-
-### 6) Tune no-odds settings for maximum forward accuracy
-
-Runs a grid search over no-odds feature settings and scores each config
-with walk-forward accuracy.
-
-```bash
-python3 scripts/tune_no_odds_walk_forward.py
-```
-
-Optional:
-
-```bash
-python3 scripts/tune_no_odds_walk_forward.py --max-candidates 24
-```
-
-Output:
-- `models/epl_no_odds_walk_forward_tuning.json`
+Then open the local URL printed by Streamlit (usually `http://localhost:8501`).
 
 ## Current tuned defaults
 
