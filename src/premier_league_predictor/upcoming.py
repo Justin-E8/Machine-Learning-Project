@@ -97,6 +97,23 @@ def _normalize_team_name(name: str, team_name_map: dict[str, str]) -> str:
     return team_name_map.get(key, raw_name)
 
 
+def _normalize_fixture_team_names(
+    fixtures: pd.DataFrame,
+    team_name_map: dict[str, str],
+) -> pd.DataFrame:
+    """Normalize HomeTeam/AwayTeam names to training-data naming."""
+    frame = fixtures.copy()
+    if frame.empty:
+        return frame
+    frame["HomeTeam"] = frame["HomeTeam"].map(
+        lambda value: _normalize_team_name(str(value), team_name_map)
+    )
+    frame["AwayTeam"] = frame["AwayTeam"].map(
+        lambda value: _normalize_team_name(str(value), team_name_map)
+    )
+    return frame
+
+
 def _normalize_fixture_columns(fixtures: pd.DataFrame) -> pd.DataFrame:
     """Normalize fixture columns to Date/Time/HomeTeam/AwayTeam."""
     frame = fixtures.copy()
@@ -383,6 +400,7 @@ def run_upcoming_predictions(
         [fixtures_feed, season_unplayed, openfootball_unplayed],
         ignore_index=True,
     )
+    fixtures = _normalize_fixture_team_names(fixtures, team_name_map)
     fixtures = fixtures.drop_duplicates(subset=["Date", "HomeTeam", "AwayTeam"]).copy()
     fixtures = fixtures.sort_values(["Date", "Time", "HomeTeam"]).reset_index(drop=True)
     if from_date is not None:
