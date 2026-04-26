@@ -114,6 +114,24 @@ python3 scripts/run_walk_forward.py --train-size 760 --test-size 38
 Outputs:
 - `models/epl_walk_forward_metrics.json`
 
+### 6) Tune no-odds settings for maximum forward accuracy
+
+Runs a grid search over no-odds feature settings and scores each config
+with walk-forward accuracy.
+
+```bash
+python3 scripts/tune_no_odds_walk_forward.py
+```
+
+Optional:
+
+```bash
+python3 scripts/tune_no_odds_walk_forward.py --max-candidates 24
+```
+
+Output:
+- `models/epl_no_odds_walk_forward_tuning.json`
+
 ## Current tuned defaults
 
 The code is tuned for stronger recent-season behavior:
