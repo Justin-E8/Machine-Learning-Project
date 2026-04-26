@@ -1,4 +1,4 @@
-"""Upcoming fixture prediction workflow for the Premier League baseline model."""
+"""Upcoming fixture prediction workflow using the current tuned model."""
 
 from __future__ import annotations
 
@@ -13,13 +13,19 @@ import requests
 
 from premier_league_predictor.baseline import (
     DEFAULT_ELO,
+    DEFAULT_ELO_K,
     DEFAULT_ELO_SEASON_DECAY,
+    DEFAULT_HOME_AWAY_LOOKBACK,
+    DEFAULT_HOME_ELO_ADVANTAGE,
     DEFAULT_STRENGTH_WINDOW,
-    ELO_K,
     FEATURE_COLUMNS,
-    HOME_ELO_ADVANTAGE,
-    _home_score,
+    _apply_elo_season_decay,
+    _expected_home_score,
+    _goal_diff_mean_tail,
+    _home_result_score,
+    _mean_tail,
     _points_for_side,
+    _safe_rest_days,
     build_step1_features,
     load_epl_matches,
     train_baseline_model,
@@ -38,46 +44,45 @@ class UpcomingPredictionArtifacts:
     training_metrics_path: Path
 
 
-def _expected_home_score(home_elo: float, away_elo: float) -> float:
-    adjusted_home = home_elo + HOME_ELO_ADVANTAGE
-    return 1.0 / (1.0 + 10.0 ** ((away_elo - adjusted_home) / 400.0))
+def _normalize_fixtures_frame(fixtures: pd.DataFrame) -> pd.DataFrame:
+    frame = fixtures.copy()
+    if "ï»¿Div" in frame.columns:
+        frame = frame.rename(columns={"ï»¿Div": "Div"})
+
+    required = {"Div", "Date", "Time", "HomeTeam", "AwayTeam"}
+    missing = sorted(required.difference(frame.columns))
+    if missing:
+        raise ValueError(f"fixtures feed missing required columns: {missing}")
+
+    frame = frame[frame["Div"] == "E0"].copy()
+    frame["Date"] = pd.to_datetime(frame["Date"], dayfirst=True, errors="coerce")
+    frame = frame.dropna(subset=["Date", "HomeTeam", "AwayTeam"]).copy()
+    frame["Time"] = frame["Time"].fillna("").astype(str)
+    return frame.sort_values(["Date", "Time", "HomeTeam"]).reset_index(drop=True)
 
 
-def _apply_elo_season_decay(team_elo: dict[str, float], decay: float) -> None:
-    for team, elo in team_elo.items():
-        team_elo[team] = DEFAULT_ELO + decay * (elo - DEFAULT_ELO)
-
-
-def load_upcoming_fixtures(div_code: str = "E0") -> pd.DataFrame:
-    """Load upcoming fixtures feed and filter to one division code."""
+def load_upcoming_fixtures() -> pd.DataFrame:
+    """Fetch EPL upcoming fixtures feed from football-data."""
     response = requests.get(FIXTURES_URL, timeout=30)
     response.raise_for_status()
     text = response.text.lstrip("\ufeff")
-    fixtures = pd.read_csv(StringIO(text))
-    if "ï»¿Div" in fixtures.columns:
-        fixtures = fixtures.rename(columns={"ï»¿Div": "Div"})
-
-    required_cols = {"Div", "Date", "Time", "HomeTeam", "AwayTeam"}
-    missing = sorted(required_cols.difference(fixtures.columns))
-    if missing:
-        raise ValueError(f"Fixtures feed missing required columns: {missing}")
-
-    fixtures = fixtures[fixtures["Div"] == div_code].copy()
-    fixtures["Date"] = pd.to_datetime(fixtures["Date"], dayfirst=True, errors="coerce")
-    fixtures = fixtures.dropna(subset=["Date", "HomeTeam", "AwayTeam"]).copy()
-    return fixtures.sort_values(["Date", "Time", "HomeTeam"]).reset_index(drop=True)
+    raw = pd.read_csv(StringIO(text))
+    return _normalize_fixtures_frame(raw)
 
 
-def _build_state_from_completed_matches(
-    completed_matches: pd.DataFrame,
+def _build_team_state(
+    matches: pd.DataFrame,
+    *,
     elo_season_decay: float,
-) -> tuple[dict[str, list[dict[str, float]]], dict[str, float]]:
-    """Build team form history + Elo state from completed matches only."""
-    team_history: dict[str, list[dict[str, float]]] = {}
+    elo_k: float,
+    home_elo_advantage: float,
+) -> tuple[dict[str, list[dict[str, float | bool | pd.Timestamp]]], dict[str, float]]:
+    """Build team histories and Elo ratings from completed matches."""
+    team_history: dict[str, list[dict[str, float | bool | pd.Timestamp]]] = {}
     team_elo: dict[str, float] = {}
     current_season: str | None = None
 
-    for _, match in completed_matches.iterrows():
+    for _, match in matches.iterrows():
         season_code = str(match["season_code"])
         if current_season is None:
             current_season = season_code
@@ -85,116 +90,129 @@ def _build_state_from_completed_matches(
             _apply_elo_season_decay(team_elo, decay=elo_season_decay)
             current_season = season_code
 
+        match_date = pd.Timestamp(match["Date"])
         home = str(match["HomeTeam"])
         away = str(match["AwayTeam"])
         result = str(match["FTR"])
         home_goals = float(match["FTHG"])
         away_goals = float(match["FTAG"])
 
-        home_elo_pre = team_elo.get(home, DEFAULT_ELO)
-        away_elo_pre = team_elo.get(away, DEFAULT_ELO)
+        home_elo_pre = float(team_elo.get(home, DEFAULT_ELO))
+        away_elo_pre = float(team_elo.get(away, DEFAULT_ELO))
 
         team_history.setdefault(home, []).append(
             {
-                "points": _points_for_side(result, "home"),
+                "points": float(_points_for_side(result, "home")),
                 "goals_for": home_goals,
                 "goals_against": away_goals,
+                "is_home": True,
+                "date": match_date,
             }
         )
         team_history.setdefault(away, []).append(
             {
-                "points": _points_for_side(result, "away"),
+                "points": float(_points_for_side(result, "away")),
                 "goals_for": away_goals,
                 "goals_against": home_goals,
+                "is_home": False,
+                "date": match_date,
             }
         )
 
-        expected_home = _expected_home_score(home_elo_pre, away_elo_pre)
-        actual_home = _home_score(result)
-        team_elo[home] = home_elo_pre + ELO_K * (actual_home - expected_home)
-        team_elo[away] = away_elo_pre + ELO_K * ((1.0 - actual_home) - (1.0 - expected_home))
+        expected_home = _expected_home_score(home_elo_pre, away_elo_pre, home_elo_advantage)
+        actual_home = _home_result_score(result)
+        team_elo[home] = home_elo_pre + elo_k * (actual_home - expected_home)
+        team_elo[away] = away_elo_pre + elo_k * ((1.0 - actual_home) - (1.0 - expected_home))
 
     return team_history, team_elo
 
 
-def _build_features_for_upcoming_fixtures(
-    fixtures: pd.DataFrame,
-    team_history: dict[str, list[dict[str, float]]],
+def _feature_row_for_fixture(
+    fixture_date: pd.Timestamp,
+    fixture_time: str,
+    home: str,
+    away: str,
+    *,
+    team_history: dict[str, list[dict[str, float | bool | pd.Timestamp]]],
     team_elo: dict[str, float],
     lookback: int,
     strength_window: int,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Create pre-match model features for upcoming fixtures."""
-    rows: list[dict[str, float | str | pd.Timestamp]] = []
-    skipped: list[dict[str, str]] = []
+    home_away_lookback: int,
+) -> dict[str, float | str | pd.Timestamp] | None:
+    """Build a single pre-match feature row for a future fixture."""
+    home_hist = team_history.get(home, [])
+    away_hist = team_history.get(away, [])
+    home_home_hist = [r for r in home_hist if bool(r["is_home"])]
+    away_away_hist = [r for r in away_hist if not bool(r["is_home"])]
 
-    for _, fixture in fixtures.iterrows():
-        home = str(fixture["HomeTeam"])
-        away = str(fixture["AwayTeam"])
-        home_hist = team_history.get(home, [])
-        away_hist = team_history.get(away, [])
+    if (
+        len(home_hist) < lookback
+        or len(away_hist) < lookback
+        or len(home_home_hist) < home_away_lookback
+        or len(away_away_hist) < home_away_lookback
+    ):
+        return None
 
-        if len(home_hist) < lookback or len(away_hist) < lookback:
-            skipped.append(
-                {
-                    "date": fixture["Date"].date().isoformat(),
-                    "home_team": home,
-                    "away_team": away,
-                    "reason": "insufficient_history",
-                }
-            )
-            continue
+    home_strength_n = min(strength_window, len(home_hist))
+    away_strength_n = min(strength_window, len(away_hist))
+    home_last_date = pd.Timestamp(home_hist[-1]["date"])
+    away_last_date = pd.Timestamp(away_hist[-1]["date"])
+    home_rest_days = _safe_rest_days(fixture_date, home_last_date)
+    away_rest_days = _safe_rest_days(fixture_date, away_last_date)
 
-        home_recent = pd.DataFrame(home_hist[-lookback:])
-        away_recent = pd.DataFrame(away_hist[-lookback:])
-        home_strength = pd.DataFrame(home_hist[-strength_window:])
-        away_strength = pd.DataFrame(away_hist[-strength_window:])
+    home_elo_pre = float(team_elo.get(home, DEFAULT_ELO))
+    away_elo_pre = float(team_elo.get(away, DEFAULT_ELO))
 
-        home_elo_pre = team_elo.get(home, DEFAULT_ELO)
-        away_elo_pre = team_elo.get(away, DEFAULT_ELO)
-
-        rows.append(
-            {
-                "date": fixture["Date"],
-                "time": fixture["Time"],
-                "home_team": home,
-                "away_team": away,
-                "home_points_last5": float(home_recent["points"].mean()),
-                "home_goals_for_last5": float(home_recent["goals_for"].mean()),
-                "home_goals_against_last5": float(home_recent["goals_against"].mean()),
-                "away_points_last5": float(away_recent["points"].mean()),
-                "away_goals_for_last5": float(away_recent["goals_for"].mean()),
-                "away_goals_against_last5": float(away_recent["goals_against"].mean()),
-                "home_points_per_match_strength": float(home_strength["points"].mean()),
-                "away_points_per_match_strength": float(away_strength["points"].mean()),
-                "home_goal_diff_per_match_strength": float(
-                    (home_strength["goals_for"] - home_strength["goals_against"]).mean()
-                ),
-                "away_goal_diff_per_match_strength": float(
-                    (away_strength["goals_for"] - away_strength["goals_against"]).mean()
-                ),
-                "home_elo_pre": home_elo_pre,
-                "away_elo_pre": away_elo_pre,
-                "elo_diff_pre": home_elo_pre - away_elo_pre,
-            }
-        )
-
-    return pd.DataFrame(rows), pd.DataFrame(skipped)
+    return {
+        "date": fixture_date,
+        "time": fixture_time,
+        "home_team": home,
+        "away_team": away,
+        "home_points_last5": _mean_tail(home_hist, "points", lookback),
+        "home_goals_for_last5": _mean_tail(home_hist, "goals_for", lookback),
+        "home_goals_against_last5": _mean_tail(home_hist, "goals_against", lookback),
+        "away_points_last5": _mean_tail(away_hist, "points", lookback),
+        "away_goals_for_last5": _mean_tail(away_hist, "goals_for", lookback),
+        "away_goals_against_last5": _mean_tail(away_hist, "goals_against", lookback),
+        "home_home_points_lastN": _mean_tail(home_home_hist, "points", home_away_lookback),
+        "home_home_goals_for_lastN": _mean_tail(home_home_hist, "goals_for", home_away_lookback),
+        "home_home_goals_against_lastN": _mean_tail(
+            home_home_hist, "goals_against", home_away_lookback
+        ),
+        "away_away_points_lastN": _mean_tail(away_away_hist, "points", home_away_lookback),
+        "away_away_goals_for_lastN": _mean_tail(away_away_hist, "goals_for", home_away_lookback),
+        "away_away_goals_against_lastN": _mean_tail(
+            away_away_hist, "goals_against", home_away_lookback
+        ),
+        "home_points_last3": _mean_tail(home_hist, "points", 3),
+        "away_points_last3": _mean_tail(away_hist, "points", 3),
+        "home_goal_diff_last3": _goal_diff_mean_tail(home_hist, 3),
+        "away_goal_diff_last3": _goal_diff_mean_tail(away_hist, 3),
+        "home_points_per_match_strength": _mean_tail(home_hist, "points", home_strength_n),
+        "away_points_per_match_strength": _mean_tail(away_hist, "points", away_strength_n),
+        "home_goal_diff_per_match_strength": _goal_diff_mean_tail(home_hist, home_strength_n),
+        "away_goal_diff_per_match_strength": _goal_diff_mean_tail(away_hist, away_strength_n),
+        "home_rest_days": home_rest_days,
+        "away_rest_days": away_rest_days,
+        "rest_days_diff": home_rest_days - away_rest_days,
+        "home_elo_pre": home_elo_pre,
+        "away_elo_pre": away_elo_pre,
+        "elo_diff_pre": home_elo_pre - away_elo_pre,
+    }
 
 
 def run_upcoming_predictions(
     project_root: Path,
+    *,
     lookback: int = 5,
     strength_window: int = DEFAULT_STRENGTH_WINDOW,
+    home_away_lookback: int = DEFAULT_HOME_AWAY_LOOKBACK,
     elo_season_decay: float = DEFAULT_ELO_SEASON_DECAY,
+    elo_k: float = DEFAULT_ELO_K,
+    home_elo_advantage: float = DEFAULT_HOME_ELO_ADVANTAGE,
     from_date: date | None = None,
 ) -> UpcomingPredictionArtifacts:
-    """
-    Train baseline model on completed matches and predict upcoming EPL fixtures.
-
-    If `from_date` is provided, only fixtures on/after that date are included.
-    By default, all currently unplayed fixtures in the feed are included.
-    """
+    """Train current model and predict upcoming EPL fixtures."""
     raw_fixtures_path = project_root / "data" / "raw" / "epl_upcoming_fixtures.csv"
     predictions_path = project_root / "data" / "processed" / "epl_upcoming_predictions.csv"
     predictions_json_path = project_root / "models" / "epl_upcoming_predictions.json"
@@ -206,105 +224,116 @@ def run_upcoming_predictions(
     predictions_path.parent.mkdir(parents=True, exist_ok=True)
     training_metrics_path.parent.mkdir(parents=True, exist_ok=True)
 
-    completed_matches = load_epl_matches()
-    completed_features = build_step1_features(
-        completed_matches,
+    matches = load_epl_matches()
+    features = build_step1_features(
+        matches=matches,
         lookback=lookback,
         strength_window=strength_window,
+        home_away_lookback=home_away_lookback,
         elo_season_decay=elo_season_decay,
+        elo_k=elo_k,
+        home_elo_advantage=home_elo_advantage,
     )
-    model, metrics, completed_predictions = train_baseline_model(completed_features)
+    model, metrics, completed_predictions = train_baseline_model(features)
     completed_predictions.to_csv(completed_predictions_path, index=False)
     training_metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
-    fixtures = load_upcoming_fixtures(div_code="E0")
+    fixtures = load_upcoming_fixtures()
     if from_date is not None:
         fixtures = fixtures[fixtures["Date"].dt.date >= from_date].copy()
 
-    completed_fixture_keys = {
-        (row.Date.date(), str(row.HomeTeam), str(row.AwayTeam))
-        for row in completed_matches.itertuples(index=False)
+    # Remove any fixtures already present in completed results.
+    completed_keys = {
+        (pd.Timestamp(row.Date).date(), str(row.HomeTeam), str(row.AwayTeam))
+        for row in matches.itertuples(index=False)
     }
     fixtures = fixtures[
         ~fixtures.apply(
-            lambda row: (row["Date"].date(), str(row["HomeTeam"]), str(row["AwayTeam"]))
-            in completed_fixture_keys,
+            lambda row: (pd.Timestamp(row["Date"]).date(), str(row["HomeTeam"]), str(row["AwayTeam"]))
+            in completed_keys,
             axis=1,
         )
     ].copy()
-    raw_fixtures_path.write_text(fixtures.to_csv(index=False), encoding="utf-8")
+    fixtures.to_csv(raw_fixtures_path, index=False)
 
-    team_history, team_elo = _build_state_from_completed_matches(
-        completed_matches=completed_matches,
+    team_history, team_elo = _build_team_state(
+        matches,
         elo_season_decay=elo_season_decay,
-    )
-    fixture_features, skipped = _build_features_for_upcoming_fixtures(
-        fixtures=fixtures,
-        team_history=team_history,
-        team_elo=team_elo,
-        lookback=lookback,
-        strength_window=strength_window,
+        elo_k=elo_k,
+        home_elo_advantage=home_elo_advantage,
     )
 
-    if fixture_features.empty:
-        empty_columns = ["date", "time", "home_team", "away_team", "predicted_target"] + [
-            f"pred_prob_{label}" for label in ("home_win", "draw", "away_win")
-        ]
-        pd.DataFrame(columns=empty_columns).to_csv(predictions_path, index=False)
-        predictions_json_path.write_text("[]", encoding="utf-8")
-        if skipped.empty:
-            pd.DataFrame(columns=["date", "home_team", "away_team", "reason"]).to_csv(
-                skipped_path, index=False
+    feature_rows: list[dict[str, float | str | pd.Timestamp]] = []
+    skipped_rows: list[dict[str, str]] = []
+    for _, fixture in fixtures.iterrows():
+        fixture_date = pd.Timestamp(fixture["Date"])
+        fixture_time = str(fixture.get("Time", ""))
+        home = str(fixture["HomeTeam"])
+        away = str(fixture["AwayTeam"])
+        feature_row = _feature_row_for_fixture(
+            fixture_date,
+            fixture_time,
+            home,
+            away,
+            team_history=team_history,
+            team_elo=team_elo,
+            lookback=lookback,
+            strength_window=strength_window,
+            home_away_lookback=home_away_lookback,
+        )
+        if feature_row is None:
+            skipped_rows.append(
+                {
+                    "date": fixture_date.date().isoformat(),
+                    "home_team": home,
+                    "away_team": away,
+                    "reason": "insufficient_history",
+                }
             )
-        else:
-            skipped.to_csv(skipped_path, index=False)
-        print("No upcoming fixtures available after filtering.")
-        print(f"Fixtures checked: {raw_fixtures_path}")
-        return UpcomingPredictionArtifacts(
-            fixtures_path=raw_fixtures_path,
-            predictions_path=predictions_path,
-            predictions_json_path=predictions_json_path,
-            skipped_path=skipped_path,
-            completed_predictions_path=completed_predictions_path,
-            training_metrics_path=training_metrics_path,
+            continue
+        feature_rows.append(feature_row)
+
+    if not feature_rows:
+        empty = pd.DataFrame(
+            columns=[
+                "date",
+                "time",
+                "home_team",
+                "away_team",
+                "predicted_target",
+                "prediction_confidence",
+                "pred_prob_away_win",
+                "pred_prob_draw",
+                "pred_prob_home_win",
+            ]
         )
-
-    probs = model.predict_proba(fixture_features[FEATURE_COLUMNS])
-    preds = model.predict(fixture_features[FEATURE_COLUMNS])
-
-    output = fixture_features[["date", "time", "home_team", "away_team"]].copy()
-    output["predicted_target"] = preds
-    output["prediction_confidence"] = probs.max(axis=1)
-    for class_idx, class_name in enumerate(model.classes_):
-        output[f"pred_prob_{class_name}"] = probs[:, class_idx]
-
-    output = output.sort_values(["date", "time", "home_team"]).reset_index(drop=True)
-    output.to_csv(predictions_path, index=False)
-    predictions_json_path.write_text(output.to_json(orient="records", indent=2), encoding="utf-8")
-    if skipped.empty:
-        pd.DataFrame(columns=["date", "home_team", "away_team", "reason"]).to_csv(
-            skipped_path, index=False
-        )
+        empty.to_csv(predictions_path, index=False)
+        predictions_json_path.write_text("[]", encoding="utf-8")
     else:
-        skipped.to_csv(skipped_path, index=False)
+        fixture_features = pd.DataFrame(feature_rows)
+        probs = model.predict_proba(fixture_features[FEATURE_COLUMNS])
+        preds = model.predict(fixture_features[FEATURE_COLUMNS])
+        classes = list(model.classes_)
+        class_to_idx = {name: idx for idx, name in enumerate(classes)}
 
-    print("Upcoming fixture prediction complete.")
-    print(f"Upcoming fixtures saved: {raw_fixtures_path}")
-    print(f"Predictions saved: {predictions_path}")
-    print(f"Predictions JSON saved: {predictions_json_path}")
-    print(f"Skipped fixtures saved: {skipped_path}")
-    print(f"Completed predictions saved: {completed_predictions_path}")
-    print(f"Training metrics saved: {training_metrics_path}")
-    print("\nPreview:")
-    preview_cols = [
-        "date",
-        "time",
-        "home_team",
-        "away_team",
-        "predicted_target",
-        "prediction_confidence",
-    ]
-    print(output[preview_cols].head(10).to_string(index=False))
+        output = fixture_features[["date", "time", "home_team", "away_team"]].copy()
+        output["predicted_target"] = preds
+        output["prediction_confidence"] = probs.max(axis=1)
+        for label in ("away_win", "draw", "home_win"):
+            if label in class_to_idx:
+                output[f"pred_prob_{label}"] = probs[:, class_to_idx[label]]
+            else:
+                output[f"pred_prob_{label}"] = 0.0
+
+        output = output.sort_values(["date", "time", "home_team"]).reset_index(drop=True)
+        output.to_csv(predictions_path, index=False)
+        predictions_json_path.write_text(output.to_json(orient="records", indent=2), encoding="utf-8")
+
+    skipped_df = pd.DataFrame(
+        skipped_rows,
+        columns=["date", "home_team", "away_team", "reason"],
+    )
+    skipped_df.to_csv(skipped_path, index=False)
 
     return UpcomingPredictionArtifacts(
         fixtures_path=raw_fixtures_path,
