@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import date
 from io import StringIO
@@ -37,6 +38,21 @@ CURRENT_SEASON_CODE = "2526"
 CURRENT_SEASON_URL = (
     f"https://www.football-data.co.uk/mmz4281/{CURRENT_SEASON_CODE}/E0.csv"
 )
+OPENFOOTBALL_SEASON_URL = (
+    "https://raw.githubusercontent.com/openfootball/football.json/master/2025-26/en.1.json"
+)
+
+TEAM_NAME_ALIASES = {
+    "manchester united": "Man United",
+    "manchester city": "Man City",
+    "tottenham hotspur": "Spurs",
+    "nottingham forest": "Nott'm Forest",
+    "wolverhampton wanderers": "Wolves",
+    "west ham united": "West Ham",
+    "newcastle united": "Newcastle",
+    "brighton and hove albion": "Brighton",
+    "leeds united": "Leeds",
+}
 
 
 @dataclass(frozen=True)
@@ -49,6 +65,36 @@ class UpcomingPredictionArtifacts:
     skipped_path: Path
     completed_predictions_path: Path
     training_metrics_path: Path
+
+
+def _empty_fixtures_frame() -> pd.DataFrame:
+    return pd.DataFrame(columns=["Date", "Time", "HomeTeam", "AwayTeam"])
+
+
+def _canonical_team_key(name: str) -> str:
+    value = str(name).strip().lower().replace("&", " and ")
+    value = re.sub(r"[^a-z0-9]+", " ", value).strip()
+    tokens = [token for token in value.split() if token != "fc"]
+    if tokens and tokens[0] == "afc":
+        tokens = tokens[1:]
+    return " ".join(tokens)
+
+
+def _build_team_name_map(matches: pd.DataFrame) -> dict[str, str]:
+    known_names = pd.concat([matches["HomeTeam"], matches["AwayTeam"]]).dropna().astype(str).unique()
+    mapping = {_canonical_team_key(name): name for name in known_names}
+    for alias_key, target in TEAM_NAME_ALIASES.items():
+        if target in set(known_names):
+            mapping[alias_key] = target
+    return mapping
+
+
+def _normalize_team_name(name: str, team_name_map: dict[str, str]) -> str:
+    raw_name = str(name).strip()
+    if raw_name in team_name_map.values():
+        return raw_name
+    key = _canonical_team_key(raw_name)
+    return team_name_map.get(key, raw_name)
 
 
 def _normalize_fixture_columns(fixtures: pd.DataFrame) -> pd.DataFrame:
@@ -103,6 +149,48 @@ def load_current_season_unplayed_fixtures() -> pd.DataFrame:
 
     frame = frame.loc[unplayed_mask].copy()
     return frame.sort_values(["Date", "Time", "HomeTeam"]).reset_index(drop=True)
+
+
+def _openfootball_match_is_unplayed(score_value: object) -> bool:
+    if not isinstance(score_value, dict):
+        return True
+    ft_value = score_value.get("ft")
+    if isinstance(ft_value, list) and len(ft_value) == 2:
+        return any(goal is None for goal in ft_value)
+    return not bool(score_value)
+
+
+def load_openfootball_unplayed_fixtures(team_name_map: dict[str, str]) -> pd.DataFrame:
+    """Fetch remaining fixtures from OpenFootball full-season schedule."""
+    response = requests.get(OPENFOOTBALL_SEASON_URL, timeout=30)
+    response.raise_for_status()
+    payload = response.json()
+    matches = payload.get("matches", [])
+    if not matches:
+        return _empty_fixtures_frame()
+
+    rows: list[dict[str, object]] = []
+    for match in matches:
+        if not _openfootball_match_is_unplayed(match.get("score")):
+            continue
+
+        fixture_date = pd.to_datetime(match.get("date"), errors="coerce")
+        if pd.isna(fixture_date):
+            continue
+
+        rows.append(
+            {
+                "Date": fixture_date,
+                "Time": str(match.get("time") or ""),
+                "HomeTeam": _normalize_team_name(str(match.get("team1") or ""), team_name_map),
+                "AwayTeam": _normalize_team_name(str(match.get("team2") or ""), team_name_map),
+            }
+        )
+
+    if not rows:
+        return _empty_fixtures_frame()
+
+    return _normalize_fixture_columns(pd.DataFrame(rows))
 
 
 def load_upcoming_fixtures() -> pd.DataFrame:
@@ -282,9 +370,19 @@ def run_upcoming_predictions(
     completed_predictions.to_csv(completed_predictions_path, index=False)
     training_metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
+    team_name_map = _build_team_name_map(matches)
     fixtures_feed = load_upcoming_fixtures()
     season_unplayed = load_current_season_unplayed_fixtures()
-    fixtures = pd.concat([fixtures_feed, season_unplayed], ignore_index=True)
+    try:
+        openfootball_unplayed = load_openfootball_unplayed_fixtures(team_name_map)
+    except Exception:
+        # Keep workflow robust even if OpenFootball is temporarily unavailable.
+        openfootball_unplayed = _empty_fixtures_frame()
+
+    fixtures = pd.concat(
+        [fixtures_feed, season_unplayed, openfootball_unplayed],
+        ignore_index=True,
+    )
     fixtures = fixtures.drop_duplicates(subset=["Date", "HomeTeam", "AwayTeam"]).copy()
     fixtures = fixtures.sort_values(["Date", "Time", "HomeTeam"]).reset_index(drop=True)
     if from_date is not None:
