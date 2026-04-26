@@ -8,6 +8,9 @@ from pathlib import Path
 import typer
 
 from premier_league_predictor.baseline import (
+    DEFAULT_ELO_SEASON_DECAY,
+    DEFAULT_HOME_AWAY_LOOKBACK,
+    DEFAULT_STRENGTH_WINDOW,
     build_step1_features,
     compare_outcome_vs_goal_models,
     load_epl_matches,
@@ -18,17 +21,22 @@ app = typer.Typer(add_completion=False)
 
 @app.command()
 def main(
-    lookback: int = typer.Option(5, min=2, help="Number of prior matches per team."),
+    lookback: int = typer.Option(5, min=3, help="Overall recent-form window."),
     strength_window: int = typer.Option(
-        20,
+        DEFAULT_STRENGTH_WINDOW,
         min=5,
-        help="Window size for persistent team strength features.",
+        help="Window size for persistent strength features.",
+    ),
+    home_away_lookback: int = typer.Option(
+        DEFAULT_HOME_AWAY_LOOKBACK,
+        min=2,
+        help="Home-only / away-only recent window.",
     ),
     elo_season_decay: float = typer.Option(
-        0.75,
+        DEFAULT_ELO_SEASON_DECAY,
         min=0.0,
         max=1.0,
-        help="Season-to-season Elo carryover (0 resets fully, 1 keeps full history).",
+        help="Season-to-season Elo carryover (0 reset, 1 full carry).",
     ),
     max_goals: int = typer.Option(
         10,
@@ -42,6 +50,7 @@ def main(
         matches=matches,
         lookback=lookback,
         strength_window=strength_window,
+        home_away_lookback=home_away_lookback,
         elo_season_decay=elo_season_decay,
     )
     comparison = compare_outcome_vs_goal_models(features, max_goals=max_goals)
@@ -52,6 +61,7 @@ def main(
         "config": {
             "lookback": lookback,
             "strength_window": strength_window,
+            "home_away_lookback": home_away_lookback,
             "elo_season_decay": elo_season_decay,
             "max_goals": max_goals,
         },

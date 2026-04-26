@@ -6,7 +6,12 @@ from pathlib import Path
 
 import typer
 
-from premier_league_predictor.baseline import run_step1_baseline
+from premier_league_predictor.baseline import (
+    DEFAULT_ELO_SEASON_DECAY,
+    DEFAULT_HOME_AWAY_LOOKBACK,
+    DEFAULT_STRENGTH_WINDOW,
+    run_step1_baseline,
+)
 
 app = typer.Typer(add_completion=False)
 
@@ -14,14 +19,18 @@ app = typer.Typer(add_completion=False)
 @app.command()
 def main(
     lookback: int = typer.Option(5, min=3, help="Number of prior matches per team."),
-    strength_window: int = typer.Option(20, min=5, help="Window size for persistent strength."),
+    strength_window: int = typer.Option(
+        DEFAULT_STRENGTH_WINDOW,
+        min=5,
+        help="Window size for persistent strength.",
+    ),
     home_away_lookback: int = typer.Option(
-        2,
+        DEFAULT_HOME_AWAY_LOOKBACK,
         min=2,
         help="Recent home-only / away-only window size.",
     ),
     elo_season_decay: float = typer.Option(
-        0.65,
+        DEFAULT_ELO_SEASON_DECAY,
         min=0.0,
         max=1.0,
         help="Season-to-season Elo carryover (0 reset, 1 full carry).",

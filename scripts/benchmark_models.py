@@ -9,6 +9,9 @@ import pandas as pd
 import typer
 
 from premier_league_predictor.baseline import (
+    DEFAULT_ELO_SEASON_DECAY,
+    DEFAULT_HOME_AWAY_LOOKBACK,
+    DEFAULT_STRENGTH_WINDOW,
     build_step1_features,
     load_epl_matches,
     train_baseline_model,
@@ -20,14 +23,18 @@ app = typer.Typer(add_completion=False)
 @app.command()
 def main(
     lookback: int = typer.Option(5, min=3, help="Overall recent-form window."),
-    strength_window: int = typer.Option(20, min=5, help="Persistent strength window."),
+    strength_window: int = typer.Option(
+        DEFAULT_STRENGTH_WINDOW,
+        min=5,
+        help="Persistent strength window.",
+    ),
     home_away_lookback: int = typer.Option(
-        2,
+        DEFAULT_HOME_AWAY_LOOKBACK,
         min=2,
         help="Home-only / away-only recent window.",
     ),
     elo_season_decay: float = typer.Option(
-        0.65,
+        DEFAULT_ELO_SEASON_DECAY,
         min=0.0,
         max=1.0,
         help="Season-to-season Elo carryover (0 resets fully, 1 keeps full history).",

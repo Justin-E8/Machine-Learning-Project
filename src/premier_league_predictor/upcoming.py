@@ -36,6 +36,8 @@ FIXTURES_URL = "https://www.football-data.co.uk/fixtures.csv"
 
 @dataclass(frozen=True)
 class UpcomingPredictionArtifacts:
+    """Paths to files produced by the upcoming-fixtures pipeline."""
+
     fixtures_path: Path
     predictions_path: Path
     predictions_json_path: Path
@@ -45,6 +47,8 @@ class UpcomingPredictionArtifacts:
 
 
 def _normalize_fixtures_frame(fixtures: pd.DataFrame) -> pd.DataFrame:
+    """Normalize raw fixtures feed and keep only EPL rows with valid dates."""
+
     frame = fixtures.copy()
     if "ï»¿Div" in frame.columns:
         frame = frame.rename(columns={"ï»¿Div": "Div"})
@@ -212,7 +216,7 @@ def run_upcoming_predictions(
     home_elo_advantage: float = DEFAULT_HOME_ELO_ADVANTAGE,
     from_date: date | None = None,
 ) -> UpcomingPredictionArtifacts:
-    """Train current model and predict upcoming EPL fixtures."""
+    """Train the baseline on completed matches and score upcoming fixtures."""
     raw_fixtures_path = project_root / "data" / "raw" / "epl_upcoming_fixtures.csv"
     predictions_path = project_root / "data" / "processed" / "epl_upcoming_predictions.csv"
     predictions_json_path = project_root / "models" / "epl_upcoming_predictions.json"

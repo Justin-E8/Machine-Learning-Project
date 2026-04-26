@@ -71,6 +71,8 @@ class BaselineArtifacts:
 
 @dataclass(frozen=True)
 class ModelComparisonResult:
+    """Container for direct-vs-goals-vs-draw-aware comparison outputs."""
+
     logreg_metrics: dict[str, float | int | str]
     goal_based_metrics: dict[str, float | int | str]
     draw_aware_metrics: dict[str, float | int | str]
@@ -115,17 +117,20 @@ def load_epl_matches(season_codes: tuple[str, ...] = SEASON_CODES) -> pd.DataFra
 
 
 def _points_for_side(result: str, side: str) -> int:
+    """Return league points earned by one side for a match result."""
     if side == "home":
         return 3 if result == "H" else 1 if result == "D" else 0
     return 3 if result == "A" else 1 if result == "D" else 0
 
 
 def _mean_tail(records: list[dict[str, float]], key: str, n: int) -> float:
+    """Average the last ``n`` values for ``key`` from a history list."""
     tail = records[-n:]
     return float(sum(float(r[key]) for r in tail) / len(tail))
 
 
 def _goal_diff_mean_tail(records: list[dict[str, float]], n: int) -> float:
+    """Average goal-difference over the last ``n`` records."""
     tail = records[-n:]
     return float(sum(float(r["goals_for"] - r["goals_against"]) for r in tail) / len(tail))
 
@@ -138,11 +143,13 @@ def _safe_rest_days(current_date: pd.Timestamp, previous_date: pd.Timestamp) -> 
 
 
 def _expected_home_score(home_elo: float, away_elo: float, home_advantage: float) -> float:
+    """Compute expected home result score from Elo ratings."""
     adjusted_home = home_elo + home_advantage
     return 1.0 / (1.0 + 10.0 ** ((away_elo - adjusted_home) / 400.0))
 
 
 def _home_result_score(result: str) -> float:
+    """Map match result to Elo outcome score from home perspective."""
     if result == "H":
         return 1.0
     if result == "D":
@@ -153,6 +160,7 @@ def _home_result_score(result: str) -> float:
 
 
 def _apply_elo_season_decay(team_elo: dict[str, float], decay: float) -> None:
+    """Regress each team's Elo toward DEFAULT_ELO at season boundaries."""
     for team, elo in list(team_elo.items()):
         team_elo[team] = DEFAULT_ELO + decay * (elo - DEFAULT_ELO)
 
@@ -321,6 +329,7 @@ def _attach_prediction_columns(
     classes: list[str],
     split_idx: int,
 ) -> pd.DataFrame:
+    """Attach split labels and prediction/probability columns to feature rows."""
     out = features.copy()
     out["split"] = "train"
     out.loc[split_idx:, "split"] = "test"
@@ -346,6 +355,7 @@ def train_baseline_model(
       - multinomial logistic regression
       - HistGradientBoostingClassifier
     """
+    # Keep metadata columns in `features`, but train only on explicit feature sets.
     X = features
     y = features["target"]
 
@@ -442,7 +452,7 @@ def train_baseline_model(
 
 
 def _poisson_prob_vector(mean_goals: float, max_goals: int) -> np.ndarray:
-    """Return Poisson probabilities for goals 0..max_goals."""
+    """Return normalized Poisson probabilities for goals 0..max_goals."""
     safe_mean = max(float(mean_goals), 1e-8)
     probs = np.zeros(max_goals + 1, dtype=float)
     probs[0] = math.exp(-safe_mean)
@@ -569,7 +579,7 @@ def train_goal_based_model(
 
 
 def _build_draw_feature_frame(features: pd.DataFrame) -> pd.DataFrame:
-    """Build a draw-focused feature matrix from baseline pre-match features."""
+    """Build extra draw-sensitive features from baseline pre-match inputs."""
     frame = features[FEATURE_COLUMNS].copy()
     frame["abs_elo_diff"] = frame["elo_diff_pre"].abs()
     frame["abs_points_diff_last5"] = (frame["home_points_last5"] - frame["away_points_last5"]).abs()
@@ -744,6 +754,7 @@ def compare_outcome_vs_goal_models(
 
     Returns both metrics dicts and a compact summary table payload.
     """
+    # Reuse the same feature matrix so model comparisons are like-for-like.
     _, logreg_metrics, logreg_rows = train_baseline_model(features)
     goal_metrics, goal_rows = train_goal_based_model(features, max_goals=max_goals)
     draw_aware_metrics, draw_aware_rows = train_draw_aware_model(features)
