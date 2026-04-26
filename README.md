@@ -77,7 +77,6 @@ Compare direct outcome, goals-first Poisson, and draw-aware staged models:
 ```bash
 python3 scripts/compare_goal_model.py
 ```
-
 ## 3) What Step 1 does
 
 1. Downloads EPL CSV data from football-data.co.uk for seasons 2018-19 through
