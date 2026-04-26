@@ -45,13 +45,14 @@ OPENFOOTBALL_SEASON_URL = (
 TEAM_NAME_ALIASES = {
     "manchester united": "Man United",
     "manchester city": "Man City",
-    "tottenham hotspur": "Spurs",
+    "tottenham hotspur": "Tottenham",
     "nottingham forest": "Nott'm Forest",
     "wolverhampton wanderers": "Wolves",
     "west ham united": "West Ham",
     "newcastle united": "Newcastle",
     "brighton and hove albion": "Brighton",
     "leeds united": "Leeds",
+    "sunderland afc": "Sunderland",
 }
 
 
@@ -74,7 +75,7 @@ def _empty_fixtures_frame() -> pd.DataFrame:
 def _canonical_team_key(name: str) -> str:
     value = str(name).strip().lower().replace("&", " and ")
     value = re.sub(r"[^a-z0-9]+", " ", value).strip()
-    tokens = [token for token in value.split() if token != "fc"]
+    tokens = [token for token in value.split() if token not in {"fc", "afc"}]
     if tokens and tokens[0] == "afc":
         tokens = tokens[1:]
     return " ".join(tokens)
