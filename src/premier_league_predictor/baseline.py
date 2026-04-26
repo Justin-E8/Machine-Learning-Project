@@ -1,4 +1,4 @@
-"""Step 1 baseline pipeline for Premier League outcome prediction."""
+"""Model training pipeline for Premier League match outcome prediction."""
 
 from __future__ import annotations
 
@@ -12,28 +12,49 @@ import joblib
 import numpy as np
 import pandas as pd
 import requests
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression, PoissonRegressor
 from sklearn.metrics import accuracy_score, classification_report, log_loss
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 SEASON_CODES = ("1819", "1920", "2021", "2122", "2223", "2324", "2425", "2526")
+
 DEFAULT_ELO = 1500.0
-ELO_K = 20.0
-HOME_ELO_ADVANTAGE = 65.0
+DEFAULT_ELO_K = 24.0
+DEFAULT_HOME_ELO_ADVANTAGE = 80.0
 DEFAULT_STRENGTH_WINDOW = 20
-DEFAULT_ELO_SEASON_DECAY = 0.75
-FEATURE_COLUMNS = [
+DEFAULT_HOME_AWAY_LOOKBACK = 2
+DEFAULT_ELO_SEASON_DECAY = 0.65
+
+CORE_FEATURE_COLUMNS = [
     "home_points_last5",
     "home_goals_for_last5",
     "home_goals_against_last5",
     "away_points_last5",
     "away_goals_for_last5",
     "away_goals_against_last5",
+]
+
+FEATURE_COLUMNS = [
+    *CORE_FEATURE_COLUMNS,
+    "home_home_points_lastN",
+    "home_home_goals_for_lastN",
+    "home_home_goals_against_lastN",
+    "away_away_points_lastN",
+    "away_away_goals_for_lastN",
+    "away_away_goals_against_lastN",
+    "home_points_last3",
+    "away_points_last3",
+    "home_goal_diff_last3",
+    "away_goal_diff_last3",
     "home_points_per_match_strength",
     "away_points_per_match_strength",
     "home_goal_diff_per_match_strength",
     "away_goal_diff_per_match_strength",
+    "home_rest_days",
+    "away_rest_days",
+    "rest_days_diff",
     "home_elo_pre",
     "away_elo_pre",
     "elo_diff_pre",
@@ -99,8 +120,29 @@ def _points_for_side(result: str, side: str) -> int:
     return 3 if result == "A" else 1 if result == "D" else 0
 
 
-def _home_score(result: str) -> float:
-    """Convert full-time result to home-team match score for Elo updates."""
+def _mean_tail(records: list[dict[str, float]], key: str, n: int) -> float:
+    tail = records[-n:]
+    return float(sum(float(r[key]) for r in tail) / len(tail))
+
+
+def _goal_diff_mean_tail(records: list[dict[str, float]], n: int) -> float:
+    tail = records[-n:]
+    return float(sum(float(r["goals_for"] - r["goals_against"]) for r in tail) / len(tail))
+
+
+def _safe_rest_days(current_date: pd.Timestamp, previous_date: pd.Timestamp) -> float:
+    """Return non-negative rest days between matches, capped to avoid huge outliers."""
+    rest = float((current_date - previous_date).days)
+    # Cap very long offseason breaks so model focuses on meaningful cadence differences.
+    return float(max(0.0, min(rest, 30.0)))
+
+
+def _expected_home_score(home_elo: float, away_elo: float, home_advantage: float) -> float:
+    adjusted_home = home_elo + home_advantage
+    return 1.0 / (1.0 + 10.0 ** ((away_elo - adjusted_home) / 400.0))
+
+
+def _home_result_score(result: str) -> float:
     if result == "H":
         return 1.0
     if result == "D":
@@ -110,15 +152,8 @@ def _home_score(result: str) -> float:
     raise ValueError(f"Unexpected result label: {result}")
 
 
-def _expected_home_score(home_elo: float, away_elo: float) -> float:
-    """Return expected home-team score using Elo formula with home advantage."""
-    adjusted_home = home_elo + HOME_ELO_ADVANTAGE
-    return 1.0 / (1.0 + 10.0 ** ((away_elo - adjusted_home) / 400.0))
-
-
 def _apply_elo_season_decay(team_elo: dict[str, float], decay: float) -> None:
-    """Regress Elo ratings toward the default at each new season."""
-    for team, elo in team_elo.items():
+    for team, elo in list(team_elo.items()):
         team_elo[team] = DEFAULT_ELO + decay * (elo - DEFAULT_ELO)
 
 
@@ -126,19 +161,35 @@ def build_step1_features(
     matches: pd.DataFrame,
     lookback: int = 5,
     strength_window: int = DEFAULT_STRENGTH_WINDOW,
+    home_away_lookback: int = DEFAULT_HOME_AWAY_LOOKBACK,
     elo_season_decay: float = DEFAULT_ELO_SEASON_DECAY,
+    elo_k: float = DEFAULT_ELO_K,
+    home_elo_advantage: float = DEFAULT_HOME_ELO_ADVANTAGE,
 ) -> pd.DataFrame:
-    """Build rolling form and capped persistent-strength features from prior matches only."""
+    """
+    Build leak-free pre-match features from historical match results.
+
+    Includes:
+      - overall recent form
+      - home/away split recent form
+      - momentum and strength-window trends
+      - rest days
+      - pre-match Elo ratings
+    """
+    if lookback < 3:
+        raise ValueError("lookback must be at least 3")
     if strength_window < lookback:
         raise ValueError("strength_window must be >= lookback")
+    if home_away_lookback < 2:
+        raise ValueError("home_away_lookback must be at least 2")
     if not 0.0 <= elo_season_decay <= 1.0:
         raise ValueError("elo_season_decay must be between 0.0 and 1.0")
 
-    team_history: dict[str, list[dict[str, float]]] = {}
+    team_history: dict[str, list[dict[str, float | bool | pd.Timestamp]]] = {}
     team_elo: dict[str, float] = {}
     rows: list[dict[str, float | str | pd.Timestamp]] = []
-    current_season: str | None = None
 
+    current_season: str | None = None
     for _, match in matches.iterrows():
         season_code = str(match["season_code"])
         if current_season is None:
@@ -147,6 +198,7 @@ def build_step1_features(
             _apply_elo_season_decay(team_elo, decay=elo_season_decay)
             current_season = season_code
 
+        match_date = pd.Timestamp(match["Date"])
         home = str(match["HomeTeam"])
         away = str(match["AwayTeam"])
         result = str(match["FTR"])
@@ -155,36 +207,73 @@ def build_step1_features(
 
         home_hist = team_history.get(home, [])
         away_hist = team_history.get(away, [])
-        home_elo_pre = team_elo.get(home, DEFAULT_ELO)
-        away_elo_pre = team_elo.get(away, DEFAULT_ELO)
+        home_home_hist = [r for r in home_hist if bool(r["is_home"])]
+        away_away_hist = [r for r in away_hist if not bool(r["is_home"])]
 
-        if len(home_hist) >= lookback and len(away_hist) >= lookback:
-            home_recent = pd.DataFrame(home_hist[-lookback:])
-            away_recent = pd.DataFrame(away_hist[-lookback:])
-            home_strength = pd.DataFrame(home_hist[-strength_window:])
-            away_strength = pd.DataFrame(away_hist[-strength_window:])
+        home_elo_pre = float(team_elo.get(home, DEFAULT_ELO))
+        away_elo_pre = float(team_elo.get(away, DEFAULT_ELO))
+
+        has_required_history = (
+            len(home_hist) >= lookback
+            and len(away_hist) >= lookback
+            and len(home_home_hist) >= home_away_lookback
+            and len(away_away_hist) >= home_away_lookback
+        )
+
+        if has_required_history:
+            home_strength_n = min(strength_window, len(home_hist))
+            away_strength_n = min(strength_window, len(away_hist))
+
+            home_last_date = pd.Timestamp(home_hist[-1]["date"])
+            away_last_date = pd.Timestamp(away_hist[-1]["date"])
+            home_rest_days = _safe_rest_days(match_date, home_last_date)
+            away_rest_days = _safe_rest_days(match_date, away_last_date)
+
             rows.append(
                 {
-                    "date": match["Date"],
+                    "date": match_date,
                     "season_code": season_code,
                     "home_team": home,
                     "away_team": away,
                     "home_goals_actual": home_goals,
                     "away_goals_actual": away_goals,
-                    "home_points_last5": float(home_recent["points"].mean()),
-                    "home_goals_for_last5": float(home_recent["goals_for"].mean()),
-                    "home_goals_against_last5": float(home_recent["goals_against"].mean()),
-                    "away_points_last5": float(away_recent["points"].mean()),
-                    "away_goals_for_last5": float(away_recent["goals_for"].mean()),
-                    "away_goals_against_last5": float(away_recent["goals_against"].mean()),
-                    "home_points_per_match_strength": float(home_strength["points"].mean()),
-                    "away_points_per_match_strength": float(away_strength["points"].mean()),
-                    "home_goal_diff_per_match_strength": float(
-                        (home_strength["goals_for"] - home_strength["goals_against"]).mean()
+                    "home_points_last5": _mean_tail(home_hist, "points", lookback),
+                    "home_goals_for_last5": _mean_tail(home_hist, "goals_for", lookback),
+                    "home_goals_against_last5": _mean_tail(home_hist, "goals_against", lookback),
+                    "away_points_last5": _mean_tail(away_hist, "points", lookback),
+                    "away_goals_for_last5": _mean_tail(away_hist, "goals_for", lookback),
+                    "away_goals_against_last5": _mean_tail(away_hist, "goals_against", lookback),
+                    "home_home_points_lastN": _mean_tail(home_home_hist, "points", home_away_lookback),
+                    "home_home_goals_for_lastN": _mean_tail(
+                        home_home_hist, "goals_for", home_away_lookback
                     ),
-                    "away_goal_diff_per_match_strength": float(
-                        (away_strength["goals_for"] - away_strength["goals_against"]).mean()
+                    "home_home_goals_against_lastN": _mean_tail(
+                        home_home_hist, "goals_against", home_away_lookback
                     ),
+                    "away_away_points_lastN": _mean_tail(
+                        away_away_hist, "points", home_away_lookback
+                    ),
+                    "away_away_goals_for_lastN": _mean_tail(
+                        away_away_hist, "goals_for", home_away_lookback
+                    ),
+                    "away_away_goals_against_lastN": _mean_tail(
+                        away_away_hist, "goals_against", home_away_lookback
+                    ),
+                    "home_points_last3": _mean_tail(home_hist, "points", 3),
+                    "away_points_last3": _mean_tail(away_hist, "points", 3),
+                    "home_goal_diff_last3": _goal_diff_mean_tail(home_hist, 3),
+                    "away_goal_diff_last3": _goal_diff_mean_tail(away_hist, 3),
+                    "home_points_per_match_strength": _mean_tail(home_hist, "points", home_strength_n),
+                    "away_points_per_match_strength": _mean_tail(away_hist, "points", away_strength_n),
+                    "home_goal_diff_per_match_strength": _goal_diff_mean_tail(
+                        home_hist, home_strength_n
+                    ),
+                    "away_goal_diff_per_match_strength": _goal_diff_mean_tail(
+                        away_hist, away_strength_n
+                    ),
+                    "home_rest_days": home_rest_days,
+                    "away_rest_days": away_rest_days,
+                    "rest_days_diff": home_rest_days - away_rest_days,
                     "home_elo_pre": home_elo_pre,
                     "away_elo_pre": away_elo_pre,
                     "elo_diff_pre": home_elo_pre - away_elo_pre,
@@ -192,51 +281,72 @@ def build_step1_features(
                 }
             )
 
+        # Update state after feature construction (leak-free).
         team_history.setdefault(home, []).append(
             {
-                "points": _points_for_side(result, "home"),
+                "points": float(_points_for_side(result, "home")),
                 "goals_for": home_goals,
                 "goals_against": away_goals,
+                "is_home": True,
+                "date": match_date,
             }
         )
         team_history.setdefault(away, []).append(
             {
-                "points": _points_for_side(result, "away"),
+                "points": float(_points_for_side(result, "away")),
                 "goals_for": away_goals,
                 "goals_against": home_goals,
+                "is_home": False,
+                "date": match_date,
             }
         )
 
-        expected_home = _expected_home_score(home_elo_pre, away_elo_pre)
-        actual_home = _home_score(result)
-        team_elo[home] = home_elo_pre + ELO_K * (actual_home - expected_home)
-        team_elo[away] = away_elo_pre + ELO_K * ((1.0 - actual_home) - (1.0 - expected_home))
+        expected_home = _expected_home_score(home_elo_pre, away_elo_pre, home_elo_advantage)
+        actual_home = _home_result_score(result)
+        team_elo[home] = home_elo_pre + elo_k * (actual_home - expected_home)
+        team_elo[away] = away_elo_pre + elo_k * ((1.0 - actual_home) - (1.0 - expected_home))
 
     if not rows:
         raise ValueError("No training rows were generated. Lower lookback or check input data.")
-    return pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+
+    features = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+    features["date"] = pd.to_datetime(features["date"])
+    return features
+
+
+def _attach_prediction_columns(
+    features: pd.DataFrame,
+    probs: np.ndarray,
+    preds: np.ndarray,
+    classes: list[str],
+    split_idx: int,
+) -> pd.DataFrame:
+    out = features.copy()
+    out["split"] = "train"
+    out.loc[split_idx:, "split"] = "test"
+    out["predicted_target"] = preds
+    out["prediction_correct"] = out["target"] == out["predicted_target"]
+
+    class_to_idx = {name: idx for idx, name in enumerate(classes)}
+    for label in ("away_win", "draw", "home_win"):
+        if label in class_to_idx:
+            out[f"pred_prob_{label}"] = probs[:, class_to_idx[label]]
+        else:
+            out[f"pred_prob_{label}"] = 0.0
+    return out
 
 
 def train_baseline_model(
     features: pd.DataFrame,
-) -> tuple[Pipeline, dict[str, float | int], pd.DataFrame]:
-    """Train multinomial logistic regression and return model, metrics, and row-level predictions."""
-    feature_cols = [
-        "home_points_last5",
-        "home_goals_for_last5",
-        "home_goals_against_last5",
-        "away_points_last5",
-        "away_goals_for_last5",
-        "away_goals_against_last5",
-        "home_points_per_match_strength",
-        "away_points_per_match_strength",
-        "home_goal_diff_per_match_strength",
-        "away_goal_diff_per_match_strength",
-        "home_elo_pre",
-        "away_elo_pre",
-        "elo_diff_pre",
-    ]
-    X = features[feature_cols]
+) -> tuple[object, dict[str, float | int | str], pd.DataFrame]:
+    """
+    Train candidate models and return best model by log loss.
+
+    Candidates:
+      - multinomial logistic regression
+      - HistGradientBoostingClassifier
+    """
+    X = features
     y = features["target"]
 
     split_idx = int(len(features) * 0.8)
@@ -245,54 +355,94 @@ def train_baseline_model(
     if X_test.empty:
         raise ValueError("Test set is empty. Need more rows or lower training split.")
 
-    model = Pipeline(
-        steps=[
-            ("scaler", StandardScaler()),
-            (
-                "classifier",
-                LogisticRegression(
-                    max_iter=2000,
-                    random_state=42,
-                ),
+    candidates: list[tuple[str, object, list[str]]] = [
+        (
+            "logistic_core",
+            Pipeline(
+                steps=[
+                    ("scaler", StandardScaler()),
+                    ("classifier", LogisticRegression(max_iter=4000, random_state=42)),
+                ]
             ),
-        ]
-    )
-    model.fit(X_train, y_train)
-    y_pred = model.predict(X_test)
-    y_prob = model.predict_proba(X_test)
+            CORE_FEATURE_COLUMNS,
+        ),
+        (
+            "logistic_enhanced",
+            Pipeline(
+                steps=[
+                    ("scaler", StandardScaler()),
+                    ("classifier", LogisticRegression(max_iter=4000, random_state=42, C=1.5)),
+                ]
+            ),
+            FEATURE_COLUMNS,
+        ),
+        (
+            "hist_gradient_boosting",
+            HistGradientBoostingClassifier(
+                learning_rate=0.05,
+                max_depth=5,
+                max_iter=450,
+                l2_regularization=0.05,
+                random_state=42,
+            ),
+            FEATURE_COLUMNS,
+        ),
+    ]
 
+    leaderboard: list[dict[str, float | str]] = []
+    fitted: dict[str, tuple[object, list[str]]] = {}
+    for name, model, cols in candidates:
+        model.fit(X_train[cols], y_train)
+        fitted[name] = (model, cols)
+        probs_test = model.predict_proba(X_test[cols])
+        preds_test = model.predict(X_test[cols])
+        leaderboard.append(
+            {
+                "model": name,
+                "feature_count": float(len(cols)),
+                "accuracy": float(accuracy_score(y_test, preds_test)),
+                "log_loss": float(log_loss(y_test, probs_test, labels=model.classes_)),
+                "draw_pred_rate_test": float((pd.Series(preds_test) == "draw").mean()),
+            }
+        )
+
+    leaderboard_df = pd.DataFrame(leaderboard).sort_values(
+        ["log_loss", "accuracy"], ascending=[True, False]
+    )
+    best_name = str(leaderboard_df.iloc[0]["model"])
+    best_model, best_cols = fitted[best_name]
+
+    all_probs = best_model.predict_proba(X[best_cols])
+    all_preds = best_model.predict(X[best_cols])
+    features_with_predictions = _attach_prediction_columns(
+        features=features,
+        probs=all_probs,
+        preds=all_preds,
+        classes=list(best_model.classes_),
+        split_idx=split_idx,
+    )
+
+    best_test_probs = best_model.predict_proba(X_test[best_cols])
+    best_test_preds = best_model.predict(X_test[best_cols])
     metrics: dict[str, float | int | str] = {
+        "selected_model": best_name,
+        "selected_feature_count": int(len(best_cols)),
         "train_rows": len(X_train),
         "test_rows": len(X_test),
-        "accuracy": float(accuracy_score(y_test, y_pred)),
-        "log_loss": float(log_loss(y_test, y_prob, labels=model.classes_)),
+        "accuracy": float(accuracy_score(y_test, best_test_preds)),
+        "log_loss": float(log_loss(y_test, best_test_probs, labels=best_model.classes_)),
+        "draw_pred_rate_test": float((pd.Series(best_test_preds) == "draw").mean()),
+        "draw_actual_rate_test": float((y_test == "draw").mean()),
+        "classification_report_text": classification_report(
+            y_test, best_test_preds, digits=3, zero_division=0
+        ),
+        "leaderboard": leaderboard_df.to_dict(orient="records"),
     }
-    metrics["classification_report_text"] = classification_report(
-        y_test, y_pred, digits=3, zero_division=0
-    )
-
-    # Add row-level predictions so users can inspect actual vs predicted outcomes in Data Wrangler.
-    all_pred = model.predict(X)
-    all_prob = model.predict_proba(X)
-    features_with_predictions = features.copy()
-    features_with_predictions["split"] = "train"
-    features_with_predictions.loc[split_idx:, "split"] = "test"
-    features_with_predictions["predicted_target"] = all_pred
-    features_with_predictions["prediction_correct"] = (
-        features_with_predictions["target"] == features_with_predictions["predicted_target"]
-    )
-    for class_idx, class_name in enumerate(model.classes_):
-        features_with_predictions[f"pred_prob_{class_name}"] = all_prob[:, class_idx]
-
-    return model, metrics, features_with_predictions
+    return best_model, metrics, features_with_predictions
 
 
 def _poisson_prob_vector(mean_goals: float, max_goals: int) -> np.ndarray:
-    """
-    Return Poisson probabilities for goals 0..max_goals.
-
-    The vector is normalized to handle small truncation mass.
-    """
+    """Return Poisson probabilities for goals 0..max_goals."""
     safe_mean = max(float(mean_goals), 1e-8)
     probs = np.zeros(max_goals + 1, dtype=float)
     probs[0] = math.exp(-safe_mean)
@@ -350,8 +500,8 @@ def train_goal_based_model(
     split_idx = int(len(features) * 0.8)
     X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
     y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
-    yh_train, yh_test = y_home_goals.iloc[:split_idx], y_home_goals.iloc[split_idx:]
-    ya_train, ya_test = y_away_goals.iloc[:split_idx], y_away_goals.iloc[split_idx:]
+    yh_train = y_home_goals.iloc[:split_idx]
+    ya_train = y_away_goals.iloc[:split_idx]
     if X_test.empty:
         raise ValueError("Test set is empty. Need more rows or lower training split.")
 
@@ -371,7 +521,6 @@ def train_goal_based_model(
     away_goal_model.fit(X_train, ya_train)
 
     classes = ["away_win", "draw", "home_win"]
-
     test_home_means = home_goal_model.predict(X_test)
     test_away_means = away_goal_model.predict(X_test)
     test_probs = np.array(
@@ -479,7 +628,6 @@ def train_draw_aware_model(
     if X_test.empty:
         raise ValueError("Test set is empty. Need more rows or lower training split.")
 
-    # Reserve a validation tail inside training for threshold tuning.
     train_fit_end = int(len(X_train) * 0.85)
     train_fit_end = max(train_fit_end, 50)
     if train_fit_end >= len(X_train):
@@ -514,7 +662,6 @@ def train_draw_aware_model(
     y_home_fit = (y_fit[non_draw_fit] == "home_win").astype(int)
     home_away_model.fit(X_fit[non_draw_fit], y_home_fit)
 
-    # Tune draw threshold on validation to balance accuracy and draw-rate realism.
     val_p_draw = draw_model.predict_proba(X_val)[:, 1]
     val_p_home_non_draw = home_away_model.predict_proba(X_val)[:, 1]
     val_actual_draw_rate = float((y_val == "draw").mean())
@@ -534,7 +681,6 @@ def train_draw_aware_model(
             best_gap = draw_gap
             best_threshold = float(threshold)
 
-    # Refit staged models on full training window.
     draw_model.fit(X_train, (y_train == "draw").astype(int))
     non_draw_train = y_train != "draw"
     y_home_train = (y_train[non_draw_train] == "home_win").astype(int)
@@ -643,12 +789,13 @@ def run_step1_baseline(
     project_root: Path,
     lookback: int = 5,
     strength_window: int = DEFAULT_STRENGTH_WINDOW,
+    home_away_lookback: int = DEFAULT_HOME_AWAY_LOOKBACK,
     elo_season_decay: float = DEFAULT_ELO_SEASON_DECAY,
 ) -> BaselineArtifacts:
-    """Run Step 1 data/feature/model flow and write artifacts."""
+    """Run baseline training pipeline and write model/data artifacts."""
     raw_path = project_root / "data" / "raw" / "epl_matches.csv"
     training_path = project_root / "data" / "processed" / "epl_baseline_features.csv"
-    model_path = project_root / "models" / "epl_logreg_baseline.joblib"
+    model_path = project_root / "models" / "epl_best_model.joblib"
     metrics_path = project_root / "models" / "epl_baseline_metrics.json"
 
     raw_path.parent.mkdir(parents=True, exist_ok=True)
@@ -662,9 +809,9 @@ def run_step1_baseline(
         matches=matches,
         lookback=lookback,
         strength_window=strength_window,
+        home_away_lookback=home_away_lookback,
         elo_season_decay=elo_season_decay,
     )
-
     model, metrics, features_with_predictions = train_baseline_model(features)
     features_with_predictions.to_csv(training_path, index=False)
     joblib.dump(model, model_path)
@@ -675,9 +822,17 @@ def run_step1_baseline(
     print(f"Feature data saved: {training_path}")
     print(f"Model saved: {model_path}")
     print(f"Metrics saved: {metrics_path}")
-    print("\nMetrics:")
-    for key in ("train_rows", "test_rows", "accuracy", "log_loss"):
+    print("\nSelected model:")
+    print(f"  {metrics['selected_model']}")
+    print("\nSelected-model metrics:")
+    for key in ("train_rows", "test_rows", "accuracy", "log_loss", "draw_pred_rate_test"):
         print(f"  {key}: {metrics[key]}")
+    print("\nLeaderboard:")
+    for row in metrics["leaderboard"]:
+        print(
+            f"  {row['model']}: accuracy={row['accuracy']:.4f}, "
+            f"log_loss={row['log_loss']:.4f}, draw_pred_rate={row['draw_pred_rate_test']:.4f}"
+        )
 
     return BaselineArtifacts(
         raw_data_path=raw_path,
