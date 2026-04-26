@@ -52,7 +52,6 @@ TEAM_NAME_ALIASES = {
     "newcastle united": "Newcastle",
     "brighton and hove albion": "Brighton",
     "leeds united": "Leeds",
-    "sunderland afc": "Sunderland",
 }
 
 
@@ -76,8 +75,6 @@ def _canonical_team_key(name: str) -> str:
     value = str(name).strip().lower().replace("&", " and ")
     value = re.sub(r"[^a-z0-9]+", " ", value).strip()
     tokens = [token for token in value.split() if token not in {"fc", "afc"}]
-    if tokens and tokens[0] == "afc":
-        tokens = tokens[1:]
     return " ".join(tokens)
 
 
