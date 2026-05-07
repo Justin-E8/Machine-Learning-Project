@@ -3,10 +3,6 @@
 Predict EPL match outcomes (`home_win`, `draw`, `away_win`) using a single,
 no-odds, feature-based machine-learning pipeline.
 
-This repository is intentionally focused and cleaned up around one main model and one
-dashboard workflow. It is designed so someone new to the project can run it quickly,
-understand the data flow, and inspect outputs in both CSV and UI form.
-
 ---
 
 ## What this project does
@@ -127,8 +123,6 @@ The project keeps only one tuned classifier path:
   - capped persistent-strength windows
   - rest-day features
   - Elo pre-match ratings with season decay
-
-No bookmaker odds are used.
 
 ---
 
